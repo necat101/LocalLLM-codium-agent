@@ -1,0 +1,203 @@
+{
+  "name": "vscodium-agentic",
+  "displayName": "Agentic Coding Assistant",
+  "description": "Local LLM-powered agentic coding with llama.cpp",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "agentic.local",
+        "name": "agent",
+        "fullName": "Local Agent",
+        "description": "Agentic coding assistant powered by local LLMs",
+        "isSticky": true
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentic-sidebar",
+          "title": "Agentic",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "agentic-sidebar": [
+        {
+          "id": "agentic.chatView",
+          "type": "webview",
+          "name": "Local Agent Chat",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentic.startServer",
+        "title": "Agentic: Start LLM Server",
+        "icon": "$(play)"
+      },
+      {
+        "command": "agentic.stopServer",
+        "title": "Agentic: Stop LLM Server",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "agentic.selectModel",
+        "title": "Agentic: Select Model",
+        "icon": "$(database)"
+      },
+      {
+        "command": "agentic.showStatus",
+        "title": "Agentic: Show Status"
+      },
+      {
+        "command": "agentic.openSettings",
+        "title": "Agentic: Open Settings Panel",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "agentic.openChat",
+        "title": "Agentic: Open Chat Panel",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentic.clearHistory",
+        "title": "Agentic: Clear Conversation History"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "agentic.openSettings",
+        "key": "ctrl+shift+;",
+        "mac": "cmd+shift+;"
+      },
+      {
+        "command": "agentic.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ],
+    "configuration": {
+      "title": "Agentic Local LLM",
+      "properties": {
+        "agentic.llamaCpp.endpoint": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "URL of the llama.cpp server"
+        },
+        "agentic.llamaCpp.modelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to GGUF model file (for auto-starting server)"
+        },
+        "agentic.llamaCpp.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the LLM server when extension activates"
+        },
+        "agentic.model.contextLength": {
+          "type": "number",
+          "default": 32768,
+          "description": "Maximum context length for the model"
+        },
+        "agentic.model.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "description": "Maximum tokens to generate per response"
+        },
+        "agentic.model.threads": {
+          "type": "number",
+          "default": 0,
+          "description": "Number of threads to use for generation (set to 0 for auto-detect logical core count)"
+        },
+        "agentic.agent.maxIterations": {
+          "type": "number",
+          "default": 15,
+          "description": "Maximum tool call iterations per request"
+        },
+        "agentic.tools.requireConfirmation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require user confirmation before executing commands"
+        },
+        "agentic.tools.allowedCommands": {
+          "type": "array",
+          "default": [
+            "npm",
+            "node",
+            "git",
+            "python",
+            "pip",
+            "cargo",
+            "rustc",
+            "ls",
+            "dir",
+            "cat",
+            "type"
+          ],
+          "description": "Commands that can run without confirmation"
+        },
+        "agentic.sampling.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature (0 = deterministic, higher = more creative)"
+        },
+        "agentic.sampling.topP": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Top-P (nucleus) sampling threshold"
+        },
+        "agentic.sampling.topK": {
+          "type": "number",
+          "default": 40,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Top-K sampling (number of top tokens to consider)"
+        },
+        "agentic.sampling.repeatPenalty": {
+          "type": "number",
+          "default": 1.1,
+          "minimum": 1,
+          "maximum": 2,
+          "description": "Repetition penalty (1 = no penalty)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {}
+}
