@@ -8,6 +8,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { getFileTools } from './fileTools';
 
 const execAsync = promisify(exec);
 
@@ -20,6 +21,7 @@ export interface ToolContext {
     cancellationToken?: vscode.CancellationToken;
     requireConfirmation: boolean;
     allowedCommands: string[];
+    onConfirmCommand?: (command: string) => Promise<boolean>;
 }
 
 interface RegisteredTool {
@@ -42,11 +44,21 @@ export class ToolRegistry {
 
     private registerBuiltinTools(): void {
         // ─────────────────────────────────────────────────────────────
+        // File Tools (Imported from fileTools.ts)
+        // ─────────────────────────────────────────────────────────────
+        getFileTools().forEach(tool => {
+            if (tool.name === 'read_file') {
+                tool.description += ' TIP: If unsure of the path, use `run_command` with "ls -R" or "dir /s" to explore the directory structure first.';
+            }
+            this.register(tool);
+        });
+
+        // ─────────────────────────────────────────────────────────────
         // Web Search Tool
         // ─────────────────────────────────────────────────────────────
         this.register({
             name: 'web_search',
-            description: 'Search the web for documentation, tutorials, API references, or solutions. Use this to research unfamiliar topics or find current information.',
+            description: 'Search the web for documentation, tutorials, API references, or solutions. MAX 8 KEYWORDS. Use this to research unfamiliar topics or find current information.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -58,22 +70,38 @@ export class ToolRegistry {
                 required: ['query']
             },
             execute: async (args, context) => {
-                const query = args.query as string;
+                let query = (args.query as string || '').trim();
+
+                // Clean up query: strip hallucinated leading/trailing quotes
+                query = query.replace(/^["']+|["']+$/g, '').trim();
+
+                if (!query) return 'Error: Empty search query.';
+
+                // Hard enforcement of word count to prevent DDG saturation and agent laziness
+                // Auto-truncate long queries to prevent agent failure loops
+                const wordCount = query.split(/\s+/).length;
+                let warningPrefix = '';
+                if (wordCount > 8) {
+                    const truncatedQuery = query.split(/\s+/).slice(0, 8).join(' ');
+                    warningPrefix = `⚠️ **Warning**: Query too long (${wordCount} words). Truncated to first 8 words: "${truncatedQuery}"\n\n`;
+                    query = truncatedQuery;
+                }
                 const endpoints = [
                     {
                         url: `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-                        linkRegex: /<a [^>]*class="result__a" [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
-                        snippetRegex: /<a [^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g
+                        // Use more flexible regex to handle multi-class elements
+                        linkRegex: /<a [^>]*class="[^"]*result__a[^"]*" [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
+                        snippetRegex: /<a [^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g
                     },
                     {
                         url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-                        linkRegex: /<a [^>]*class="result__a" [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
-                        snippetRegex: /<a [^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g
+                        linkRegex: /<a [^>]*class="[^"]*result__a[^"]*" [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
+                        snippetRegex: /<a [^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g
                     },
                     {
                         url: `https://duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
-                        linkRegex: /<a [^>]*class="result-link" [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
-                        snippetRegex: /<div [^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/div>/g
+                        linkRegex: /<a [^>]*class="[^"]*result-link[^"]*" [^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
+                        snippetRegex: /<(td|div) [^>]*class="[^"]*result-snippet[^"]*"[^>]*>([\s\S]*?)<\/\1>/g
                     }
                 ];
 
@@ -105,10 +133,15 @@ export class ToolRegistry {
                         const snippetMatches = [...html.matchAll(endpoint.snippetRegex)];
 
                         if (linkMatches.length > 0) {
-                            const results = linkMatches.slice(0, 10).map((match, i) => {
+                            const results = linkMatches.slice(0, 6).map((match, i) => {
                                 let link = match[1];
                                 const title = match[2].replace(/<[^>]+>/g, '').trim();
-                                const snippet = snippetMatches[i] ? snippetMatches[i][1].replace(/<[^>]+>/g, '').trim() : '(No snippet)';
+                                let snippet = snippetMatches[i] ? snippetMatches[i][1].replace(/<[^>]+>/g, '').trim() : '(No snippet)';
+
+                                // Distillation: Truncate long snippets
+                                if (snippet.length > 200) {
+                                    snippet = snippet.slice(0, 197) + '...';
+                                }
 
                                 // Clean up link (un-redirect DuckDuckGo wrappers)
                                 try {
@@ -126,7 +159,7 @@ export class ToolRegistry {
                                 return `**[${title}](${link})**\n${snippet}`;
                             });
 
-                            return `Found results for "${query}":\n\n${results.join('\n\n')}\n\nUse \`read_url\` on any link to get more details.`;
+                            return `${warningPrefix}Results for "${query}":\n\n${results.join('\n\n')}`;
                         }
 
                         // Final "Brute Force" attempt on this HTML if specific classes failed
@@ -159,21 +192,33 @@ export class ToolRegistry {
         // ─────────────────────────────────────────────────────────────
         this.register({
             name: 'read_url',
-            description: 'Fetch the text content of a web page (URL). Use this to read documentation, articles, or search results found with web_search.',
+            description: 'Fetch the text content of a web page. Use this to read documentation or search results.',
             parameters: {
                 type: 'object',
                 properties: {
                     url: {
                         type: 'string',
-                        description: 'The full URL to fetch (must start with http:// or https://)'
+                        description: 'The full URL to fetch'
+                    },
+                    chunk: {
+                        type: 'number',
+                        description: 'CRITICAL: The chunk index to read (1 for first 3000 chars, 2 for next 3000, etc.). Do NOT use character offsets.'
                     }
                 },
                 required: ['url']
             },
             execute: async (args) => {
                 let url = args.url as string;
+                let chunkIdx = Math.max(1, Math.floor(args.chunk as number) || 1);
 
-                // Cleanup URL if it's a DuckDuckGo redirect that slipped through
+                if (chunkIdx > 1000) {
+                    return `⚠️ Error: Chunk ${chunkIdx} is astronomically large and likely a hallucination. \nChunk numbers are small integers (1, 2, 3...). Pages rarely exceed 20 chunks.\n\nSTOP GUESSING. Start with \`read_url("${url}", 1)\`.`;
+                }
+
+                const chunkSize = 3000;
+                const offset = (chunkIdx - 1) * chunkSize;
+
+                // Cleanup URL...
                 try {
                     if (url.includes('duckduckgo.com/l/')) {
                         const parts = url.split('?');
@@ -190,10 +235,13 @@ export class ToolRegistry {
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                             'Accept-Language': 'en-US,en;q=0.5',
+                            'Accept-Encoding': 'identity',
+                            'Cache-Control': 'no-cache',
+                            'Pragma': 'no-cache',
                             'Upgrade-Insecure-Requests': '1',
                             'Referer': 'https://www.google.com/'
                         },
-                        signal: AbortSignal.timeout(20000)
+                        signal: AbortSignal.timeout(30000)
                     });
 
                     if (!response.ok) {
@@ -203,31 +251,47 @@ export class ToolRegistry {
                     const html = await response.text();
 
                     // Simple HTML to Text conversion
-                    // 1. Remove script/style tags
                     let text = html.replace(/<(script|style|header|footer|nav|aside)[\s\S]*?<\/\1>/gi, '');
-                    // 2. Extract title if possible
                     const titleMatch = html.match(/<title>([\s\S]*?)<\/title>/i);
-                    const title = titleMatch ? `# ${titleMatch[1].trim()}\n\n` : '';
-                    // 3. Remove all other tags but keep content
+                    const title = titleMatch ? titleMatch[1].trim() : 'Untitled';
                     text = text.replace(/<[^>]+>/g, ' ');
-                    // 4. Decode common entities
                     text = text.replace(/&nbsp;/g, ' ')
                         .replace(/&lt;/g, '<')
                         .replace(/&gt;/g, '>')
                         .replace(/&amp;/g, '&')
                         .replace(/&quot;/g, '"')
                         .replace(/&#39;/g, "'");
-                    // 5. Cleanup whitespace
                     text = text.replace(/\s+/g, ' ').trim();
 
-                    // Truncate to reasonable size for LLM context (CPU speed optimization)
-                    if (text.length > 6000) {
-                        text = text.slice(0, 5000) + '\n\n... (Content truncated for length) ...';
+                    const totalLength = text.length;
+                    const totalChunks = Math.ceil(totalLength / chunkSize);
+
+                    // If model asked for an impossible chunk (like 10000), help it out
+                    if (chunkIdx > totalChunks && totalChunks > 0) {
+                        return `⚠️ Error: Chunk ${chunkIdx} does not exist. The page only has ${totalChunks} chunks.\n\nMaybe you meant \`read_url("${url}", ${totalChunks})\`?`;
                     }
 
-                    return title + (text || 'No readable text content found on this page.');
+                    const chunk = text.slice(offset, offset + chunkSize);
+                    const hasMore = offset + chunkSize < totalLength;
+                    const endChar = Math.min(offset + chunkSize, totalLength);
+
+                    if (chunk.length === 0 && totalLength > 0) {
+                        return `No content at chunk ${chunkIdx}. Page has ${totalChunks} chunks (${totalLength} chars total).`;
+                    }
+
+                    let result = `📄 **${title}**\n`;
+                    result += `📍 Chunk ${chunkIdx}/${totalChunks} (chars ${offset + 1}-${endChar} of ${totalLength})\n\n`;
+                    result += chunk;
+
+                    if (hasMore) {
+                        result += `\n\n---\n📎 More content available. Use \`read_url("${url}", ${chunkIdx + 1})\` for next chunk.`;
+                    } else {
+                        result += `\n\n---\n✅ End of content.`;
+                    }
+
+                    return result;
                 } catch (err) {
-                    return `Error fetching URL: ${err instanceof Error ? err.message : String(err)}`;
+                    return `Error fetching URL: ${err instanceof Error ? err.message : 'Unknown error'}`;
                 }
             }
         });
@@ -263,26 +327,37 @@ export class ToolRegistry {
                 );
 
                 if (context.requireConfirmation && !isAllowed) {
-                    // In a real implementation, we'd prompt the user
-                    // For now, return a notice
-                    return `⚠️ Command "${baseCommand}" requires user confirmation. Allowed commands: ${context.allowedCommands.join(', ')}`;
+                    if (context.onConfirmCommand) {
+                        const confirmed = await context.onConfirmCommand(command);
+                        if (!confirmed) {
+                            return `❌ Command execution cancelled by user: "${command}"`;
+                        }
+                    } else {
+                        return `⚠️ Command "${baseCommand}" requires user confirmation. Allowed commands: ${context.allowedCommands.join(', ')}`;
+                    }
                 }
 
                 try {
+                    // Use ComSpec if available, fallback to full System32 path for robustness
+                    const winShell = process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe';
+                    const shellOptions = process.platform === 'win32'
+                        ? { shell: winShell }
+                        : { shell: '/bin/bash' };
+
                     const { stdout, stderr } = await execAsync(command, {
                         cwd,
                         timeout: 60000,
                         maxBuffer: 1024 * 1024 * 5,
-                        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/bash'
+                        ...shellOptions
                     });
 
                     let output = '';
                     if (stdout) output += stdout;
                     if (stderr) output += (output ? '\n\nSTDERR:\n' : '') + stderr;
 
-                    // Truncate very long outputs
-                    if (output.length > 10000) {
-                        output = output.slice(0, 5000) + '\n\n... (truncated) ...\n\n' + output.slice(-2000);
+                    // Aggressively truncate for model context
+                    if (output.length > 4000) {
+                        output = output.slice(0, 2500) + '\n\n... (output truncated in context) ...\n\n' + output.slice(-1000);
                     }
 
                     return output || '(Command completed with no output)';
@@ -296,342 +371,8 @@ export class ToolRegistry {
             }
         });
 
-        // ─────────────────────────────────────────────────────────────
-        // Read File Tool
-        // ─────────────────────────────────────────────────────────────
-        this.register({
-            name: 'read_file',
-            description: 'Read the contents of a file. Use this to understand existing code, check configurations, or analyze content.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: {
-                        type: 'string',
-                        description: 'Absolute or workspace-relative path to the file'
-                    },
-                    startLine: {
-                        type: 'number',
-                        description: 'Optional: First line to read (1-indexed)'
-                    },
-                    endLine: {
-                        type: 'number',
-                        description: 'Optional: Last line to read (1-indexed)'
-                    }
-                },
-                required: ['path']
-            },
-            execute: async (args, context) => {
-                const filePath = this.resolvePath(args.path as string, context.workspaceRoot);
-                const startLine = args.startLine as number | undefined;
-                const endLine = args.endLine as number | undefined;
-
-                try {
-                    const content = await fs.readFile(filePath, 'utf-8');
-                    const lines = content.split('\n');
-
-                    if (startLine !== undefined || endLine !== undefined) {
-                        const start = Math.max(1, startLine || 1) - 1;
-                        const end = Math.min(lines.length, endLine || lines.length);
-                        const selected = lines.slice(start, end);
-                        return `Lines ${start + 1}-${end} of ${filePath}:\n\n${selected.join('\n')}`;
-                    }
-
-                    // Truncate very large files
-                    if (lines.length > 500) {
-                        return `File has ${lines.length} lines. Showing first 200:\n\n${lines.slice(0, 200).join('\n')}\n\n... (${lines.length - 200} more lines)`;
-                    }
-
-                    return content;
-                } catch (error) {
-                    return `Error reading file: ${error instanceof Error ? error.message : 'Unknown error'}`;
-                }
-            }
-        });
-
-        // ─────────────────────────────────────────────────────────────
-        // Write File Tool
-        // ─────────────────────────────────────────────────────────────
-        this.register({
-            name: 'write_file',
-            description: 'Create a new file or overwrite an existing file with content. Parent directories will be created if needed.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: {
-                        type: 'string',
-                        description: 'Absolute or workspace-relative path for the file'
-                    },
-                    content: {
-                        type: 'string',
-                        description: 'The complete file content to write'
-                    }
-                },
-                required: ['path', 'content']
-            },
-            execute: async (args, context) => {
-                const filePath = this.resolvePath(args.path as string, context.workspaceRoot);
-                const content = args.content as string;
-
-                try {
-                    // Ensure parent directory exists
-                    await fs.mkdir(path.dirname(filePath), { recursive: true });
-                    await fs.writeFile(filePath, content, 'utf-8');
-
-                    const lines = content.split('\n').length;
-                    const bytes = Buffer.byteLength(content, 'utf-8');
-                    return `✓ Successfully wrote ${filePath}\n  ${lines} lines, ${bytes} bytes`;
-                } catch (error) {
-                    return `Error writing file: ${error instanceof Error ? error.message : 'Unknown error'}`;
-                }
-            }
-        });
-
-        // ─────────────────────────────────────────────────────────────
-        // Edit File Tool (for surgical edits)
-        // ─────────────────────────────────────────────────────────────
-        this.register({
-            name: 'edit_file',
-            description: 'Make a targeted edit to a file by replacing specific content. For small, precise changes.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: {
-                        type: 'string',
-                        description: 'Path to the file to edit'
-                    },
-                    search: {
-                        type: 'string',
-                        description: 'Exact text to find and replace (must match exactly)'
-                    },
-                    replace: {
-                        type: 'string',
-                        description: 'Replacement text'
-                    }
-                },
-                required: ['path', 'search', 'replace']
-            },
-            execute: async (args, context) => {
-                const filePath = this.resolvePath(args.path as string, context.workspaceRoot);
-                const search = args.search as string;
-                const replace = args.replace as string;
-
-                try {
-                    const content = await fs.readFile(filePath, 'utf-8');
-
-                    if (!content.includes(search)) {
-                        return `Error: Could not find the search text in ${filePath}. Make sure it matches exactly.`;
-                    }
-
-                    const newContent = content.replace(search, replace);
-                    await fs.writeFile(filePath, newContent, 'utf-8');
-
-                    return `✓ Successfully edited ${filePath}\n  Replaced ${search.length} chars with ${replace.length} chars`;
-                } catch (error) {
-                    return `Error editing file: ${error instanceof Error ? error.message : 'Unknown error'}`;
-                }
-            }
-        });
-
-        // ─────────────────────────────────────────────────────────────
-        // List Directory Tool
-        // ─────────────────────────────────────────────────────────────
-        this.register({
-            name: 'list_directory',
-            description: 'List files and subdirectories in a directory. Use to explore project structure.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: {
-                        type: 'string',
-                        description: 'Directory path to list'
-                    },
-                    recursive: {
-                        type: 'boolean',
-                        description: 'If true, list recursively (max 3 levels deep)'
-                    }
-                },
-                required: ['path']
-            },
-            execute: async (args, context) => {
-                const dirPath = this.resolvePath(args.path as string, context.workspaceRoot);
-                const recursive = args.recursive as boolean;
-
-                try {
-                    const entries = await this.listDir(dirPath, recursive ? 3 : 1, 0);
-                    return entries.join('\n');
-                } catch (error) {
-                    return `Error listing directory: ${error instanceof Error ? error.message : 'Unknown error'}`;
-                }
-            }
-        });
-
-        // ─────────────────────────────────────────────────────────────
-        // Search Files Tool (grep-like)
-        // ─────────────────────────────────────────────────────────────
-        this.register({
-            name: 'search_files',
-            description: 'Search for text patterns in files within a directory. Similar to grep.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    pattern: {
-                        type: 'string',
-                        description: 'Text or regex pattern to search for'
-                    },
-                    directory: {
-                        type: 'string',
-                        description: 'Directory to search in'
-                    },
-                    filePattern: {
-                        type: 'string',
-                        description: 'Optional glob pattern for files (e.g., "*.ts")'
-                    }
-                },
-                required: ['pattern', 'directory']
-            },
-            execute: async (args, context) => {
-                const searchPattern = args.pattern as string;
-                const directory = this.resolvePath(args.directory as string, context.workspaceRoot);
-                const filePattern = args.filePattern as string | undefined;
-
-                try {
-                    const results = await this.searchInFiles(directory, searchPattern, filePattern);
-                    if (results.length === 0) {
-                        return `No matches found for "${searchPattern}" in ${directory}`;
-                    }
-                    return results.slice(0, 50).join('\n');
-                } catch (error) {
-                    return `Error searching: ${error instanceof Error ? error.message : 'Unknown error'}`;
-                }
-            }
-        });
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Helper Methods
-    // ─────────────────────────────────────────────────────────────
-
-    private resolvePath(inputPath: string, workspaceRoot: string): string {
-        if (path.isAbsolute(inputPath)) {
-            return inputPath;
-        }
-        return path.join(workspaceRoot, inputPath);
-    }
-
-    private async listDir(dirPath: string, maxDepth: number, currentDepth: number): Promise<string[]> {
-        if (currentDepth >= maxDepth) return [];
-
-        const entries = await fs.readdir(dirPath, { withFileTypes: true });
-        const results: string[] = [];
-        const indent = '  '.repeat(currentDepth);
-
-        // Sort: directories first, then files
-        entries.sort((a, b) => {
-            if (a.isDirectory() !== b.isDirectory()) {
-                return a.isDirectory() ? -1 : 1;
-            }
-            return a.name.localeCompare(b.name);
-        });
-
-        for (const entry of entries) {
-            // Skip common non-essential directories
-            if (entry.isDirectory() && ['node_modules', '.git', '__pycache__', '.next', 'dist', 'out', '.vscode'].includes(entry.name)) {
-                results.push(`${indent}[DIR] ${entry.name}/ (skipped)`);
-                continue;
-            }
-
-            if (entry.isDirectory()) {
-                results.push(`${indent}[DIR] ${entry.name}/`);
-                const subEntries = await this.listDir(path.join(dirPath, entry.name), maxDepth, currentDepth + 1);
-                results.push(...subEntries);
-            } else {
-                const stat = await fs.stat(path.join(dirPath, entry.name));
-                const size = this.formatBytes(stat.size);
-                results.push(`${indent}[FILE] ${entry.name} (${size})`);
-            }
-        }
-
-        return results;
-    }
-
-    private formatBytes(bytes: number): string {
-        if (bytes < 1024) return `${bytes} B`;
-        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-        return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-    }
-
-    private async searchInFiles(directory: string, pattern: string, filePattern?: string): Promise<string[]> {
-        const results: string[] = [];
-        const regex = new RegExp(pattern, 'gi');
-
-        const processFile = async (filePath: string) => {
-            try {
-                // Read file, but limit size to 10MB to prevent hangs on massive binaries
-                const stats = await fs.stat(filePath);
-                if (stats.size > 10 * 1024 * 1024) {
-                    // For very large files, we check for matches but don't read the whole thing at once
-                    // For now, let's keep it simple and skip 10MB+ to maintain performance
-                    return;
-                }
-
-                const content = await fs.readFile(filePath, 'utf-8');
-                const lines = content.split('\n');
-
-                for (let i = 0; i < lines.length; i++) {
-                    if (regex.test(lines[i])) {
-                        // Clean line: remove non-printable/binary garbage
-                        let cleaned = lines[i].replace(/[^\x20-\x7E\n\r\t]/g, '');
-                        cleaned = cleaned.replace(/\s+/g, ' ').trim();
-
-                        // Truncate long lines (especially common in binaries/minified files)
-                        if (cleaned.length > 150) {
-                            cleaned = cleaned.slice(0, 147) + '...';
-                        }
-
-                        if (cleaned.length > 0) {
-                            results.push(`${filePath}:${i + 1}: ${cleaned}`);
-                        } else {
-                            results.push(`${filePath}:${i + 1}: [Non-printable content match]`);
-                        }
-
-                        if (results.length >= 50) return;
-                    }
-                    regex.lastIndex = 0; // Reset regex state
-                }
-            } catch {
-                // Skip files that can't be read
-            }
-        };
-
-        const walkDir = async (dir: string) => {
-            if (results.length >= 50) return;
-
-            const entries = await fs.readdir(dir, { withFileTypes: true });
-
-            for (const entry of entries) {
-                if (results.length >= 50) return;
-
-                const fullPath = path.join(dir, entry.name);
-
-                if (entry.isDirectory()) {
-                    if (!['node_modules', '.git', '__pycache__'].includes(entry.name)) {
-                        await walkDir(fullPath);
-                    }
-                } else {
-                    if (filePattern) {
-                        const ext = path.extname(entry.name);
-                        if (!filePattern.includes(ext) && !filePattern.includes(entry.name)) {
-                            continue;
-                        }
-                    }
-                    await processFile(fullPath);
-                }
-            }
-        };
-
-        await walkDir(directory);
-        return results;
-    }
 
     // ─────────────────────────────────────────────────────────────
     // Public API

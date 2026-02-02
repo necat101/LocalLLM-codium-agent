@@ -1,0 +1,69 @@
+{# Falcon-H1 / ChatML Template with Tool Calling Support #}
+{%- set ns = namespace(found=false) -%}
+{%- for message in messages -%}
+    {%- if message['role'] == 'system' -%}
+        {%- set ns.found = true -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if not ns.found -%}
+{{- '<|im_start|>system\nYou are a professional autonomous AI agent. Use tools until the task is complete without asking for permission.<|im_end|>\n' -}}
+{%- endif -%}
+
+{#- Tool definitions if provided -#}
+{%- if tools -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{{- '<|im_start|>system\n' -}}
+{{- message['content'] -}}
+{{- '\n\n# Available Tools\nYou have access to the following tools. To use a tool, respond with a JSON object wrapped in ```tool_call markers:\n\n```tool_call\n{"name": "tool_name", "arguments": {"arg1": "value1"}}\n```\n\n# Best Practices\n- **Explore First**: Before reading files, use `run_command` (e.g., "dir" or "ls -R") to verify file paths and directory structure.
+- **Deep Research**: Search results are snippets. usage of `read_url` is MANDATORY for code examples. DO NOT guess implementation details.
+- **Complete Code**: Write working, compilable code. No placeholders, no "stub" implementations.
+- **Verify**: Always run commands to prove your code works.
+- **ACTION REQUIRED**: Once you have the full content, use `write_file`. Do not explain; WRITE IT.
+
+Tools:
+' -}}
+{%- for tool in tools -%}
+{%- if tool.type == 'function' -%}
+{{- '- ' + tool.function.name + ': ' + tool.function.description + '\n' -}}
+{%- if tool.function.parameters and tool.function.parameters.properties -%}
+{{- '  Parameters: ' + tool.function.parameters.properties | tojson + '\n' -}}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{{- '<|im_end|>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- else -%}
+{#- No tools, use standard format -#}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{{- '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+
+{#- Process other messages -#}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}
+{{- '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- if message['tool_calls'] -%}
+{%- for tc in message['tool_calls'] -%}
+{{- '```tool_call\n{"name": "' + tc.function.name + '", "arguments": ' + tc.function.arguments + '}\n```\n' -}}
+{%- endfor -%}
+{%- endif -%}
+{%- if message['content'] -%}
+{{- message['content'] -}}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- elif message['role'] == 'tool' -%}
+{{- '<|im_start|>user\n[Tool Result for ' + message['name'] + ']:\n' + message['content'] + '<|im_end|>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+
+{#- Generation prompt -#}
+{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- endif -%}

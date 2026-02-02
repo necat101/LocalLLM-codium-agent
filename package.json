@@ -2,7 +2,7 @@
   "name": "vscodium-agentic",
   "displayName": "Agentic Coding Assistant",
   "description": "Local LLM-powered agentic coding with llama.cpp",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "publisher": "local",
   "engines": {
     "vscode": "^1.80.0"
@@ -100,6 +100,16 @@
           "default": "http://localhost:8080",
           "description": "URL of the llama.cpp server"
         },
+        "agentic.llamaCpp.binaryType": {
+          "type": "string",
+          "default": "vulkan",
+          "enum": [
+            "cpu",
+            "vulkan",
+            "cuda"
+          ],
+          "description": "Hardware optimization for downloaded binaries. Choosing Vulkan is recommended for ROG Ally."
+        },
         "agentic.llamaCpp.modelPath": {
           "type": "string",
           "default": "",
@@ -112,8 +122,8 @@
         },
         "agentic.model.contextLength": {
           "type": "number",
-          "default": 32768,
-          "description": "Maximum context length for the model"
+          "default": 4096,
+          "description": "Context length for the language model. Lower values (4096) are faster on CPU."
         },
         "agentic.model.maxTokens": {
           "type": "number",
@@ -124,6 +134,22 @@
           "type": "number",
           "default": 0,
           "description": "Number of threads to use for generation (set to 0 for auto-detect logical core count)"
+        },
+        "agentic.model.chatTemplate": {
+          "type": "string",
+          "default": "chatml",
+          "enum": [
+            "chatml",
+            "auto",
+            "llama3",
+            "mistral-v7",
+            "hermes-2-pro",
+            "phi4",
+            "gemma",
+            "command-r",
+            "llama2"
+          ],
+          "description": "Chat template format. ChatML works for most models (Falcon-H1, OpenHermes, Yi, etc). Use 'auto' to use model's built-in template."
         },
         "agentic.agent.maxIterations": {
           "type": "number",
@@ -148,7 +174,13 @@
             "ls",
             "dir",
             "cat",
-            "type"
+            "type",
+            "echo",
+            "pwd",
+            "mkdir",
+            "ls",
+            "ps",
+            "tasklist"
           ],
           "description": "Commands that can run without confirmation"
         },
@@ -179,6 +211,51 @@
           "minimum": 1,
           "maximum": 2,
           "description": "Repetition penalty (1 = no penalty)"
+        },
+        "agentic.performance.flashAttention": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Flash Attention (-fa) for faster inference/prefill"
+        },
+        "agentic.performance.batchSize": {
+          "type": "number",
+          "default": 512,
+          "description": "Batch size for prefill (-b)"
+        },
+        "agentic.performance.ubatchSize": {
+          "type": "number",
+          "default": 128,
+          "description": "Physical batch size for prefill (-ub)"
+        },
+        "agentic.performance.cacheQuant": {
+          "type": "string",
+          "default": "f16",
+          "enum": [
+            "f16",
+            "q8_0",
+            "q4_0"
+          ],
+          "description": "KV cache quantization type (-ctk, -ctv). q8_0 or q4_0 saves VRAM/bandwidth but may lose quality."
+        },
+        "agentic.performance.cacheReuse": {
+          "type": "number",
+          "default": 0,
+          "description": "KV cache reuse similarity threshold (0.0-1.0). Higher = stricter match. Set to 0 to disable."
+        },
+        "agentic.performance.noWarmup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip the initial warmup run of the model (--no-warmup)."
+        },
+        "agentic.performance.mlock": {
+          "type": "boolean",
+          "default": false,
+          "description": "Force the system to keep the model in RAM (--mlock)."
+        },
+        "agentic.performance.mmap": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable memory-mapped files (--mmap)."
         }
       }
     }

@@ -191,12 +191,12 @@ export class ServerManager {
                         'Cancel'
                     );
                     if (fallback === 'Download') {
-                        const dlSuccess = await this.bootstrapManager.bootstrap();
+                        const dlSuccess = await this.promptAndBootstrap();
                         if (dlSuccess) serverPath = this.findServerExecutable();
                     }
                 }
             } else if (action === 'Download Pre-built Binary') {
-                const success = await this.bootstrapManager.bootstrap();
+                const success = await this.promptAndBootstrap();
                 if (success) {
                     serverPath = this.findServerExecutable();
                 }
@@ -208,29 +208,86 @@ export class ServerManager {
         }
 
         const config = vscode.workspace.getConfiguration('agentic');
-        const contextLength = config.get<number>('model.contextLength', 32768);
+        const contextLength = config.get<number>('model.contextLength', 4096);
         let threads = config.get<number>('model.threads', 0);
 
         if (threads <= 0) {
-            threads = require('os').cpus().length;
+            // Default to physical cores (approx Total/2) to avoid hyperthreading contention and cache thrashing on CPU
+            const logicalCores = require('os').cpus().length;
+            threads = Math.max(1, Math.floor(logicalCores / 2));
         }
+
+        const batchSize = config.get<number>('performance.batchSize', 512);
+        const ubatchSize = config.get<number>('performance.ubatchSize', 128);
+        const flashAttn = config.get<boolean>('performance.flashAttention', true);
+        const cacheQuant = config.get<string>('performance.cacheQuant', 'f16');
+        const cacheReuse = config.get<number>('performance.cacheReuse', 0);
+        const noWarmup = config.get<boolean>('performance.noWarmup', false);
+        const mlock = config.get<boolean>('performance.mlock', false);
+        const mmap = config.get<boolean>('performance.mmap', true);
+        const chatTemplate = config.get<string>('model.chatTemplate', 'chatml');
 
         // Start server
         this.outputChannel.show();
+        if (!serverPath) {
+            this.outputChannel.appendLine('Error: Server path is null');
+            return false;
+        }
         this.outputChannel.appendLine(`Starting server with model: ${path.basename(modelPath)}`);
         this.outputChannel.appendLine(`Context length: ${contextLength}`);
         this.outputChannel.appendLine(`Threads: ${threads}`);
+        this.outputChannel.appendLine(`Performance: FA=${flashAttn ? 'Enabled' : 'Auto'}, B=${batchSize}, UB=${ubatchSize}, Cache=${cacheQuant}, Reuse=${cacheReuse}`);
+        this.outputChannel.appendLine(`Chat Template: ${chatTemplate}`);
         this.outputChannel.appendLine('---');
 
         try {
-            this.serverProcess = spawn(serverPath, [
+            const args = [
                 '-m', modelPath,
                 '-c', contextLength.toString(),
                 '-t', threads.toString(),
                 '--host', '127.0.0.1',
                 '--port', '8080',
-                '-np', '1' // single slot for simplicity
-            ], {
+                '-np', '1', // single slot for simplicity
+                '-b', batchSize.toString(),
+                '-ub', ubatchSize.toString()
+            ];
+
+            if (cacheReuse > 0) {
+                args.push('--cache-reuse', cacheReuse.toString());
+            }
+            if (noWarmup) args.push('--no-warmup');
+            if (mlock) args.push('--mlock');
+            if (!mmap) args.push('--no-mmap');
+
+            if (flashAttn) {
+                args.push('-fa', 'on');
+            }
+
+            if (cacheQuant !== 'f16') {
+                args.push('-ctk', cacheQuant);
+                args.push('-ctv', cacheQuant);
+            }
+
+            // Chat template handling with tool support
+            // Use custom template file for ChatML-based models (Falcon-H1, Qwen, etc.) to enable tool calling
+            const extensionPath = this.context.extensionPath;
+            const customTemplatePath = path.join(extensionPath, 'templates', 'falcon-h1-tools.jinja');
+
+            // Explicitly set base template format if known
+            if (chatTemplate && chatTemplate !== 'auto') {
+                args.push('--chat-template', chatTemplate);
+            }
+
+            // Override with custom tool template if applicable
+            if (chatTemplate === 'chatml' && require('fs').existsSync(customTemplatePath)) {
+                args.push('--chat-template-file', customTemplatePath);
+                this.outputChannel.appendLine(`Using custom tool template: ${customTemplatePath}`);
+            }
+
+            // Enable Jinja template processing for tool calling
+            args.push('--jinja');
+
+            this.serverProcess = spawn(serverPath, args, {
                 cwd: path.dirname(serverPath)
             });
 
@@ -251,10 +308,39 @@ export class ServerManager {
                 this.notifyStatus();
             });
 
-            this.serverProcess.on('exit', (code) => {
+            this.serverProcess.on('exit', async (code) => {
                 this.outputChannel.appendLine(`Server exited with code: ${code}`);
                 this.serverProcess = null;
+                const failedModel = modelPath;
                 this.currentModel = null;
+
+                if (code !== 0 && code !== null) {
+                    this.outputChannel.appendLine(`--- Server Failure Analysis ---`);
+                    if (failedModel && !fs.existsSync(failedModel)) {
+                        this.outputChannel.appendLine(`❌ Error: Model file not found: ${failedModel}`);
+                        vscode.window.showErrorMessage(`LLM Server failed: Model file not found.`);
+                        this.notifyStatus();
+                        return;
+                    }
+
+                    const action = await vscode.window.showErrorMessage(
+                        `LLM Server failed (code ${code}). Check logs for details.`,
+                        'Switch to CPU Settings',
+                        'Restart Server',
+                        'Cancel'
+                    );
+
+                    if (action === 'Switch to CPU Settings') {
+                        const config = vscode.workspace.getConfiguration('agentic');
+                        await config.update('performance.flashAttention', false, vscode.ConfigurationTarget.Global);
+                        await config.update('performance.mmap', false, vscode.ConfigurationTarget.Global);
+                        await config.update('llamaCpp.binaryType', 'cpu', vscode.ConfigurationTarget.Global);
+                        await vscode.window.showInformationMessage('Settings updated to CPU-safe defaults. Try starting the server again.');
+                    } else if (action === 'Restart Server') {
+                        this.startServer(failedModel);
+                    }
+                }
+
                 this.notifyStatus();
             });
 
@@ -278,6 +364,27 @@ export class ServerManager {
      */
     isServerInstalled(): boolean {
         return this.findServerExecutable() !== null;
+    }
+
+    private async promptAndBootstrap(): Promise<boolean> {
+        const items: (vscode.QuickPickItem & { type: 'cpu' | 'vulkan' | 'cuda' })[] = [
+            { label: 'CPU Only', description: 'Universal, but slowest', type: 'cpu' },
+            { label: 'Vulkan (GPU)', description: 'Best for AMD/Intel/ROG Ally', type: 'vulkan' },
+            { label: 'CUDA (NVIDIA)', description: 'Best for NVIDIA GPUs', type: 'cuda' }
+        ];
+
+        const selected = await vscode.window.showQuickPick(items, {
+            placeHolder: 'Select hardware optimization for binary download',
+            title: 'Download llama.cpp Binary'
+        });
+
+        if (!selected) return false;
+
+        // Save preference
+        const config = vscode.workspace.getConfiguration('agentic');
+        await config.update('llamaCpp.binaryType', selected.type, vscode.ConfigurationTarget.Global);
+
+        return await this.bootstrapManager.bootstrap(selected.type);
     }
 
     private findServerExecutable(): string | null {
