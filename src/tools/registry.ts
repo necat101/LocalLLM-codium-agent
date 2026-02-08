@@ -9,6 +9,7 @@ import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { getFileTools } from './fileTools';
+import { askExpertAI } from './browserAI';
 
 const execAsync = promisify(exec);
 
@@ -58,7 +59,7 @@ export class ToolRegistry {
         // ─────────────────────────────────────────────────────────────
         this.register({
             name: 'web_search',
-            description: 'Search the web for documentation, tutorials, API references, or solutions. MAX 8 KEYWORDS. Use this to research unfamiliar topics or find current information.',
+            description: 'Search the web for documentation or tutorials. 10 WORD LIMIT - be specific. Use this to research unfamiliar topics.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -77,13 +78,12 @@ export class ToolRegistry {
 
                 if (!query) return 'Error: Empty search query.';
 
-                // Hard enforcement of word count to prevent DDG saturation and agent laziness
-                // Auto-truncate long queries to prevent agent failure loops
-                const wordCount = query.split(/\s+/).length;
+                // Enforce 10-word limit for general searches
                 let warningPrefix = '';
-                if (wordCount > 8) {
-                    const truncatedQuery = query.split(/\s+/).slice(0, 8).join(' ');
-                    warningPrefix = `⚠️ **Warning**: Query too long (${wordCount} words). Truncated to first 8 words: "${truncatedQuery}"\n\n`;
+                const wordCount = query.split(/\s+/).length;
+                if (wordCount > 10) {
+                    const truncatedQuery = query.split(/\s+/).slice(0, 10).join(' ');
+                    warningPrefix = `⚠️ **Warning**: Query too long (${wordCount} words). Truncated to 10 words. \n\n`;
                     query = truncatedQuery;
                 }
                 const endpoints = [
@@ -208,7 +208,11 @@ export class ToolRegistry {
                 required: ['url']
             },
             execute: async (args) => {
-                let url = args.url as string;
+                let url = (args.url as string || '').trim();
+
+                // Clean up hallucinated prefixes/suffixes
+                url = url.replace(/^[#\s]+/, '').replace(/[#\s]+$/, '').trim();
+
                 let chunkIdx = Math.max(1, Math.floor(args.chunk as number) || 1);
 
                 if (chunkIdx > 1000) {
@@ -245,7 +249,7 @@ export class ToolRegistry {
                     });
 
                     if (!response.ok) {
-                        return `Failed to fetch URL: ${response.status} ${response.statusText}\nURL: ${url}`;
+                        return `Failed to fetch URL: ${response.status} ${response.statusText}\nURL: ${url}\n\nTIP: The link might be dead. Try to read local files instead if you are debuging a compiler error, or try a different search query.`;
                     }
 
                     const html = await response.text();
@@ -297,6 +301,144 @@ export class ToolRegistry {
         });
 
         // ─────────────────────────────────────────────────────────────
+        // Error Search Tool (Google, no truncation)
+        // ─────────────────────────────────────────────────────────────
+        this.register({
+            name: 'error_search',
+            description: 'Search for compiler/runtime errors. 10 WORD LIMIT - be concise. Use ask_expert for deep reasoning.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    error: {
+                        type: 'string',
+                        description: 'The full error message from the compiler or runtime'
+                    }
+                },
+                required: ['error']
+            },
+            execute: async (args) => {
+                let query = (args.error as string || '').trim();
+
+                // Clean up query: strip ANSI codes and excessive whitespace
+                query = query
+                    .replace(/\x1b\[[0-9;]*m/g, '')  // Remove ANSI color codes
+                    .replace(/\s+/g, ' ')             // Collapse whitespace
+                    .replace(/^["']+|["']+$/g, '')    // Strip quotes
+                    .trim();
+
+                if (!query) return 'Error: Empty error query.';
+
+                // Enforce word limit to prevent sending massive functions to search
+                let warningPrefix = '';
+                const errorWords = query.split(/\s+/);
+                if (errorWords.length > 10) {
+                    query = errorWords.slice(0, 10).join(' ');
+                    warningPrefix = `⚠️ **Warning**: Error query too long. Truncated to 10 words. \n\nTIP: For complex code errors, use \`ask_expert\` and paste the full error there instead.\n\n`;
+                }
+
+                // Use Google for higher quality error results
+                const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+
+                try {
+                    const response = await fetch(googleUrl, {
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Cache-Control': 'no-cache'
+                        },
+                        signal: AbortSignal.timeout(15000)
+                    });
+
+                    if (!response.ok) {
+                        return `Google search failed: ${response.status}. Try searching manually.`;
+                    }
+
+                    const html = await response.text();
+
+                    // Extract search results from Google HTML
+                    // Google uses <h3> for result titles and nearby <a> for links
+                    const results: string[] = [];
+
+                    // Pattern for Google result blocks
+                    const resultBlocks = html.match(/<div class="[^"]*g[^"]*"[^>]*>[\s\S]*?<\/div>\s*<\/div>/g) || [];
+
+                    for (const block of resultBlocks.slice(0, 8)) {
+                        // Extract title from h3
+                        const titleMatch = block.match(/<h3[^>]*>([\s\S]*?)<\/h3>/);
+                        // Extract URL
+                        const urlMatch = block.match(/href="(https?:\/\/[^"]+)"/);
+
+                        if (titleMatch && urlMatch) {
+                            const title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
+                            const url = urlMatch[1];
+
+                            // Skip Google's own pages
+                            if (url.includes('google.com') || url.includes('webcache')) continue;
+
+                            results.push(`**[${title}](${url})**`);
+                        }
+                    }
+
+                    // Fallback: try simpler link extraction
+                    if (results.length === 0) {
+                        const links = [...html.matchAll(/href="(https?:\/\/(?:stackoverflow|github|rust-lang|docs\.rs)[^"]+)"/g)]
+                            .map(m => m[1])
+                            .filter((v, i, a) => a.indexOf(v) === i)  // unique
+                            .slice(0, 5);
+
+                        for (const link of links) {
+                            results.push(`**[${new URL(link).hostname}](${link})**`);
+                        }
+                    }
+
+                    if (results.length === 0) {
+                        return `${warningPrefix}No results found for error. Try simplifying the error message or use ask_expert for a direct fix:\n${googleUrl}`;
+                    }
+
+                    return `${warningPrefix}🔍 Error search results for:\n\`${query.slice(0, 100)}${query.length > 100 ? '...' : ''}\`\n\n${results.join('\n\n')}`;
+
+                } catch (err) {
+                    return `Error searching: ${err instanceof Error ? err.message : 'Unknown error'}.\nManual search: ${googleUrl}`;
+                }
+            }
+        });
+        // ─────────────────────────────────────────────────────────────
+        // Ask Expert AI Tool (uses DuckDuckGo AI - FREE, no login)
+        // ─────────────────────────────────────────────────────────────
+        this.register({
+            name: 'ask_expert',
+            description: 'Ask DuckDuckGo AI (FREE, no login) for debugging help. Uses Claude/GPT-4o-mini/Llama.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    question: {
+                        type: 'string',
+                        description: 'The question to ask, including error messages and relevant code'
+                    }
+                },
+                required: ['question']
+            },
+            execute: async (args) => {
+                const question = (args.question as string || '').trim();
+
+                if (!question) return 'Error: Empty question.';
+
+                // Create a concise prompt
+                const prompt = `Fix this code error. Provide ONLY the corrected code, no explanations:\n\n${question.slice(0, 2000)}`;
+
+                // Use Groq's free API (or self-help if no API key)
+                const result = await askExpertAI(prompt);
+
+                if (result.success && result.response) {
+                    return `🧠 **Expert AI Response:**\n\n${result.response}`;
+                } else {
+                    return `❌ **Expert AI Error:**\n${result.error || 'Failed to get response'}`;
+                }
+            }
+        });
+
+        // ─────────────────────────────────────────────────────────────
         // Run Terminal Command Tool
         // ─────────────────────────────────────────────────────────────
         this.register({
@@ -317,8 +459,16 @@ export class ToolRegistry {
                 required: ['command']
             },
             execute: async (args, context) => {
-                const command = args.command as string;
+                let command = args.command as string;
                 const cwd = (args.cwd as string) || context.workspaceRoot;
+
+                // Auto-fix Unix path syntax for Windows
+                if (process.platform === 'win32') {
+                    // Fix ./command to .\command  
+                    command = command.replace(/^\.\//, '.\\');
+                    // Fix paths like ./dir/file to .\dir\file
+                    command = command.replace(/\s\.\/(\S+)/g, ' .\\$1');
+                }
 
                 // Security check: extract base command
                 const baseCommand = command.split(/\s+/)[0].toLowerCase();

@@ -5,6 +5,7 @@
 import * as vscode from 'vscode';
 export declare class BootstrapManager {
     private context;
+    private outputChannel;
     constructor(context: vscode.ExtensionContext);
     /**
      * Get the expected path for the bootstrapped server binary
@@ -21,12 +22,12 @@ export declare class BootstrapManager {
     /**
      * Bootstrap the server binary for the current platform
      */
-    bootstrap(): Promise<boolean>;
+    bootstrap(type?: 'cpu' | 'vulkan' | 'cuda'): Promise<boolean>;
     /**
      * Bootstrap CMake if missing
      */
     bootstrapCMake(): Promise<boolean>;
     private downloadFile;
-    private extractZip;
+    private extractAsset;
 }
 //# sourceMappingURL=bootstrap.d.ts.map

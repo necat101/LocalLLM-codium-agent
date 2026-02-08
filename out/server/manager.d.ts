@@ -35,6 +35,7 @@ export declare class ServerManager {
      * Check if a server executable is available (bootstrapped or locally built)
      */
     isServerInstalled(): boolean;
+    private promptAndBootstrap;
     private findServerExecutable;
     private waitForServerReady;
     /**

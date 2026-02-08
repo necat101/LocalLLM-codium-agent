@@ -16,16 +16,27 @@ interface ChatMessage {
     toolResults?: Array<{ name: string; result: string }>; // For local state tracking
 }
 
-const SHARED_SYSTEM_PROMPT = `You are a powerful AI coding assistant.
-Workspace: {WORKSPACE}
+const SHARED_SYSTEM_PROMPT = `You are Falcon, an autonomous coding agent. You respond ONLY with tool calls, no explanations.
 
-## Core Directives
-1. **Smart Research**: Use \`web_search\` whenever you are unsure or need technical documentation. If you have the info, prioritize local implementation.
-2. **Show, Don't Tell**: Code MUST go in source files (NOT .md). Never describe code in text and use placeholders in tools.
-3. **Surgical First**: Use \`edit_file\` or \`replace_lines\`. Avoid \`write_file\` unless creating a NEW file.
-4. **Complete Fidelity**: No placeholders. Write EVERY necessary line.
-5. **Terminal Validation**: Use \`run_command\` to verify your work.
-6. **Autonomy**: Use tools until 100% done.
+Available tools:
+- write_file: Create/overwrite files with code
+- run_command: Execute shell commands (compile, run, test)
+- web_search: Research APIs, algorithms, documentation
+- read_url: Read content from a URL
+- error_search: Search for solutions to compiler/runtime errors
+- ask_expert: Ask DuckDuckGo AI (FREE) for complex debugging
+- list_directory: List files in a directory
+- read_file: Read file contents
+
+Workflow: write_file → run_command (compile) → ask_expert (if stuck on errors) → fix
+
+Example:
+User: write hello world in rust
+Assistant: <tool_call>
+{"name": "write_file", "arguments": {"path": "main.rs", "content": "fn main() { println!(\"Hello, world!\"); }"}}
+</tool_call>
+
+Workspace: {WORKSPACE}
 `;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -176,9 +187,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     }
                     assistantMsg.content += chunk;
                     // Send partial update to webview
+                    // Calculate display index (excluding system messages)
+                    const displayIndex = this.messages.filter(m => m.role !== 'system').length - 1;
                     this._view?.webview.postMessage({
                         command: 'streamChunk',
-                        index: this.messages.length - 1,
+                        index: displayIndex,
                         content: assistantMsg.content
                     });
                 }
@@ -370,7 +383,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                             }
                         });
                     }
-                } catch { /* skip */ }
+                } catch {
+                    // Try to fix common JSON issues (unquoted keys, missing quotes)
+                    try {
+                        let fixed = match[1]
+                            .replace(/(\{|\,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')  // Quote unquoted keys
+                            .replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([\},])/g, ':"$1"$2')  // Quote unquoted string values
+                            .replace(/'/g, '"');  // Replace single quotes with double quotes
+                        const parsed = JSON.parse(fixed);
+                        if (parsed.name) {
+                            calls.push({
+                                id: `call_${Date.now()}_${calls.length}`,
+                                type: 'function',
+                                function: {
+                                    name: parsed.name,
+                                    arguments: JSON.stringify(parsed.arguments || parsed.params || parsed.parameters || {})
+                                }
+                            });
+                        }
+                    } catch { /* skip if still fails */ }
+                }
             }
         }
 
@@ -659,7 +691,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         function formatContent(content) {
-            let html = content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            // Strip think blocks (model reasoning that shouldn't be shown)
+            // Use regex with escaped angle brackets to avoid HTML parsing issues
+            let cleaned = content.replace(/&lt;think&gt;[\\s\\S]*?&lt;\\/think&gt;/gi, '');
+            cleaned = cleaned.replace(/\\x3cthink\\x3e[\\s\\S]*?\\x3c\\/think\\x3e/gi, '');
+            
+            let html = cleaned.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             html = html.replace(/\`\`\`(\\w*)\\n([\\s\\S]*?)\`\`\`/g, '<pre><code>$2</code></pre>');
             html = html.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
             html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');

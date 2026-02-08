@@ -193,8 +193,14 @@ export class LlamaCppClient {
                         const chunk: ChatCompletionChunk = JSON.parse(trimmed.slice(6));
                         const delta = chunk.choices[0]?.delta;
 
+                        // Yield main content
                         if (delta?.content) {
                             yield delta.content;
+                        }
+
+                        // Some models put reasoning in a separate field
+                        if ((delta as Record<string, unknown>)?.reasoning_content) {
+                            yield (delta as Record<string, unknown>).reasoning_content as string;
                         }
 
                         // Accumulate tool calls

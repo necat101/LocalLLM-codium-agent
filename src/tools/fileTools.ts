@@ -264,8 +264,35 @@ export function getFileTools(): { name: string, description: string, parameters:
             execute: async (args, context) => {
                 const inputPath = args.path as string;
                 const filePath = resolvePath(inputPath, context.workspaceRoot);
-                const content = args.content as string;
-                if (!content || !content.trim()) return `❌ Error: Content cannot be empty.`;
+
+                // Try to get content from various possible field names (model might use wrong names)
+                let content = args.content as string;
+                if (!content || !content.trim()) {
+                    // Try alternate field names the model might use
+                    content = (args.code || args.text || args.data || args.source || args.body || '') as string;
+                }
+
+                if (!content || !content.trim()) {
+                    return `❌ Error: File content is empty. Please provide the actual code in the 'content' parameter.\n\nExample:\n{"name": "write_file", "arguments": {"path": "main.rs", "content": "fn main() { println!(\"Hello!\"); }"}}`;
+                }
+
+                // Normalize space artifacts (fixes common copy-paste errors)
+                content = normalizeContent(content);
+
+                // Strip trailing JSON artifacts that may leak from tool call structure
+                // This handles cases like: fn main() { } "}}}  or  fn main() { } }\n")}}
+                content = content.replace(/["}\]\s]*$/, (match) => {
+                    // Only strip if it looks like JSON leftovers (contains unmatched quotes/braces)
+                    if (/["}]{2,}/.test(match)) {
+                        // Find where the actual code ends (last legitimate bracket/semicolon)
+                        const codeEnd = content.lastIndexOf('}');
+                        if (codeEnd > 0) {
+                            return ''; // Strip the JSON garbage
+                        }
+                    }
+                    return match; // Keep original if it's not JSON garbage
+                });
+                content = content.trim();
 
                 const relativePath = path.relative(context.workspaceRoot, filePath);
                 const pathParts = relativePath.split(path.sep).filter(p => p && p !== '.');
@@ -314,7 +341,10 @@ export function getFileTools(): { name: string, description: string, parameters:
 
                     const normalizedContent = content.replace(/\r\n/g, '\n');
                     const normalizedSearch = search.replace(/\r\n/g, '\n');
-                    const normalizedReplace = replace.replace(/\r\n/g, '\n');
+                    let normalizedReplace = replace.replace(/\r\n/g, '\n');
+
+                    // Normalize space artifacts (fixes common copy-paste errors)
+                    normalizedReplace = normalizeContent(normalizedReplace);
 
                     const strictIndex = normalizedContent.indexOf(normalizedSearch);
                     let targetStart = -1, targetEnd = -1;
@@ -323,17 +353,36 @@ export function getFileTools(): { name: string, description: string, parameters:
                         targetStart = strictIndex;
                         targetEnd = strictIndex + normalizedSearch.length;
                     } else {
+                        // Try fuzzy whitespace matching
                         const escapedSearch = normalizedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                         const fuzzyPattern = escapedSearch.replace(/\s+/g, '\\s+');
                         const fuzzyRegex = new RegExp(fuzzyPattern, 'g');
                         const matches = Array.from(normalizedContent.matchAll(fuzzyRegex));
+
                         if (matches.length === 1) {
                             targetStart = matches[0].index!;
                             targetEnd = targetStart + matches[0][0].length;
                         } else if (matches.length > 1) {
-                            return `❌ Error: Multiple matches found.`;
+                            return `❌ Error: Multiple matches found. Be more specific.`;
                         } else {
-                            return `❌ Error: Could not find search text.`;
+                            // Try to find similar lines to help the model
+                            const searchLines = normalizedSearch.split('\n').map(l => l.trim()).filter(l => l.length > 5);
+                            const contentLines = normalizedContent.split('\n');
+                            const similarLines: string[] = [];
+
+                            for (const searchLine of searchLines.slice(0, 2)) {
+                                for (let i = 0; i < contentLines.length; i++) {
+                                    if (contentLines[i].includes(searchLine.slice(0, 20))) {
+                                        similarLines.push(`  Line ${i + 1}: ${contentLines[i].slice(0, 60)}`);
+                                    }
+                                }
+                            }
+
+                            let hint = `❌ Error: Could not find search text.\n\nTIP: Use read_file first to see exact content.`;
+                            if (similarLines.length > 0) {
+                                hint += `\n\nSimilar lines found:\n${similarLines.slice(0, 3).join('\n')}`;
+                            }
+                            return hint;
                         }
                     }
 
@@ -455,4 +504,21 @@ export function getFileTools(): { name: string, description: string, parameters:
             }
         }
     ];
+}
+
+/**
+ * Normalizes content by replacing problematic Unicode characters with ASCII equivalents.
+ * Common in code snippets copied from the web (middle dots for spaces, smart quotes, etc.)
+ */
+function normalizeContent(text: string): string {
+    return text
+        .replace(/\u00A0/g, ' ')       // Non-breaking space
+        .replace(/\u00B7/g, ' ')       // Middle dot (sometimes used to show spaces)
+        .replace(/\u2018|\u2019/g, "'") // Smart single quotes
+        .replace(/\u201C|\u201D/g, '"') // Smart double quotes
+        .replace(/\u2013/g, '-')       // En dash
+        .replace(/\u2014/g, '--')      // Em dash
+        .replace(/[\u200B-\u200F]/g, '') // Zero width space, non-joiner, joiner, LTR/RTL marks
+        .replace(/\u2026/g, '...')     // Ellipsis
+        .replace(/[\u2028\u2029]/g, '\n'); // Line/paragraph separators
 }

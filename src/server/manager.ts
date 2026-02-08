@@ -273,15 +273,14 @@ export class ServerManager {
             const extensionPath = this.context.extensionPath;
             const customTemplatePath = path.join(extensionPath, 'templates', 'falcon-h1-tools.jinja');
 
-            // Explicitly set base template format if known
-            if (chatTemplate && chatTemplate !== 'auto') {
-                args.push('--chat-template', chatTemplate);
-            }
-
-            // Override with custom tool template if applicable
+            // Use custom template file if it exists (takes precedence over built-in templates)
             if (chatTemplate === 'chatml' && require('fs').existsSync(customTemplatePath)) {
+                // Use ONLY the custom template file, not both flags
                 args.push('--chat-template-file', customTemplatePath);
                 this.outputChannel.appendLine(`Using custom tool template: ${customTemplatePath}`);
+            } else if (chatTemplate && chatTemplate !== 'auto') {
+                // Fall back to built-in template
+                args.push('--chat-template', chatTemplate);
             }
 
             // Enable Jinja template processing for tool calling

@@ -11,6 +11,7 @@ export interface ToolContext {
     cancellationToken?: vscode.CancellationToken;
     requireConfirmation: boolean;
     allowedCommands: string[];
+    onConfirmCommand?: (command: string) => Promise<boolean>;
 }
 export interface ToolResult {
     success: boolean;
@@ -21,10 +22,6 @@ export declare class ToolRegistry {
     private tools;
     constructor();
     private registerBuiltinTools;
-    private resolvePath;
-    private listDir;
-    private formatBytes;
-    private searchInFiles;
     register(tool: {
         name: string;
         description: string;

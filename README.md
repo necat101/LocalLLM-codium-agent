@@ -1,4 +1,4 @@
-# VSCodium Agentic - Local LLM Coding Assistant ***IN PROGRESS***
+# VSCodium Agentic - Local LLM Coding Assistant
 
 An open-source, privacy-first agentic coding assistant for VSCodium/VSCode that runs entirely on local LLMs via llama.cpp.
 
@@ -134,4 +134,3 @@ The agent has access to these tools:
 ## License
 
 MIT
-

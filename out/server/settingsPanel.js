@@ -134,9 +134,19 @@ class SettingsPanel {
     }
     getHtmlContent(config, status) {
         const isInstalled = this.serverManager.isServerInstalled();
+        const flashAttention = config.get('performance.flashAttention', true);
+        const threads = config.get('model.threads', 0);
+        const batchSize = config.get('performance.batchSize', 512);
+        const ubatchSize = config.get('performance.ubatchSize', 128);
+        const cacheQuant = config.get('performance.cacheQuant', 'q8_0');
+        const cacheReuse = config.get('performance.cacheReuse', 0);
+        const noWarmup = config.get('performance.noWarmup', true);
+        const mlock = config.get('performance.mlock', false);
+        const mmap = config.get('performance.mmap', true);
         const modelPath = config.get('llamaCpp.modelPath', '');
         const contextLength = config.get('model.contextLength', 32768);
         const maxTokens = config.get('model.maxTokens', 4096);
+        const chatTemplate = config.get('model.chatTemplate', 'chatml');
         const temperature = config.get('sampling.temperature', 0.7);
         const topP = config.get('sampling.topP', 0.9);
         const topK = config.get('sampling.topK', 40);
@@ -297,7 +307,8 @@ class SettingsPanel {
         }
         
         input[type="text"],
-        input[type="number"] {
+        input[type="number"],
+        select {
             width: 100%;
             padding: 8px 12px;
             background: var(--input-bg);
@@ -305,6 +316,19 @@ class SettingsPanel {
             border-radius: 4px;
             color: var(--fg);
             font-size: 0.9rem;
+        }
+        
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+        
+        input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
         }
         
         input[type="range"] {
@@ -360,6 +384,100 @@ class SettingsPanel {
         </div>
     </div>
     
+    <!-- Performance Boost Card -->
+    <div class="card">
+        <h2>🚀 Performance Optimizations</h2>
+        <div class="grid-2">
+            <div class="form-group">
+                <label class="checkbox-group">
+                    <input type="checkbox" id="flashAttention" ${flashAttention ? 'checked' : ''} 
+                           onchange="saveSetting('performance.flashAttention', this.checked); validatePerformanceSettings()">
+                    Flash Attention (-fa)
+                </label>
+                <div id="fa-hint" style="font-size: 0.75rem; opacity: 0.7; color: var(--warning); display: ${cacheQuant !== 'f16' ? 'block' : 'none'};">
+                    ⚠️ Required by Quantized Cache
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="checkbox-group">
+                    <input type="checkbox" id="noWarmup" ${noWarmup ? 'checked' : ''} 
+                           onchange="saveSetting('performance.noWarmup', this.checked)">
+                    No Warmup (--no-warmup)
+                </label>
+            </div>
+            <div class="form-group">
+                <label class="checkbox-group">
+                    <input type="checkbox" id="mlock" ${mlock ? 'checked' : ''} 
+                           onchange="saveSetting('performance.mlock', this.checked)">
+                    Lock RAM (--mlock)
+                </label>
+            </div>
+            <div class="form-group">
+                <label class="checkbox-group">
+                    <input type="checkbox" id="mmap" ${mmap ? 'checked' : ''} 
+                           onchange="saveSetting('performance.mmap', this.checked)">
+                    Memory Map (--mmap)
+                </label>
+            </div>
+        </div>
+        
+        <div class="grid-2" style="margin-top: 10px;">
+            <div class="form-group">
+                <label>Thread Count (-t)</label>
+                <input type="number" id="threads" value="${threads}" 
+                       onchange="saveSetting('model.threads', parseInt(this.value))">
+                <small style="opacity: 0.7;">0 = Auto (Physical Cores)</small>
+            </div>
+            <div class="form-group" style="display: flex; align-items: flex-end;">
+                <button onclick="applyLowLatencyPreset()" class="secondary" style="width: 100%;">⚡ Low Latency Preset</button>
+            </div>
+        </div>
+
+        <div class="grid-2" style="margin-top: 10px;">
+            <div class="form-group">
+                <label>Batch Size (-b)</label>
+                <input type="number" id="batchSize" value="${batchSize}" 
+                       onchange="saveSetting('performance.batchSize', parseInt(this.value))">
+            </div>
+            <div class="form-group">
+                <label>U-Batch Size (-ub)</label>
+                <input type="number" id="ubatchSize" value="${ubatchSize}" 
+                       onchange="saveSetting('performance.ubatchSize', parseInt(this.value))">
+            </div>
+            <div class="form-group">
+                <label>KV Cache Quantization</label>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <label class="checkbox-group">
+                        <input type="checkbox" id="enableCacheQuant" ${cacheQuant !== 'f16' ? 'checked' : ''} 
+                               onchange="validatePerformanceSettings()">
+                        Enable Quantized Cache
+                    </label>
+                    <select id="cacheQuant" style="display: ${cacheQuant !== 'f16' ? 'block' : 'none'};" 
+                            onchange="saveSetting('performance.cacheQuant', this.value); validatePerformanceSettings()">
+                        <option value="q8_0" ${cacheQuant === 'q8_0' ? 'selected' : ''}>q8_0 (Recommended)</option>
+                        <option value="q4_0" ${cacheQuant === 'q4_0' ? 'selected' : ''}>q4_0 (Extreme Saving)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Cache Reuse Threshold <small>(0 = disabled)</small></label>
+                <input type="number" id="cacheReuse" value="${cacheReuse}" 
+                       min="0" max="1" step="0.1"
+                       onchange="saveSetting('performance.cacheReuse', parseFloat(this.value))">
+                <div class="help-text" style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; line-height: 1.4;">
+                    <strong>How it works:</strong> When enabled, the server compares your new prompt to the previous one. 
+                    If similarity exceeds this threshold (0.0-1.0), it reuses cached KV states instead of recomputing, speeding up prefill.<br><br>
+                    <strong>Trade-offs:</strong><br>
+                    • <strong>0</strong> = Disabled (safest, always recompute)<br>
+                    • <strong>0.5</strong> = Reuse if 50%+ of prefix matches (good for multi-turn chat)<br>
+                    • <strong>0.9</strong> = Very strict, only reuse near-identical prompts<br><br>
+                    <strong>⚠️ Warning:</strong> Low values (e.g., 0.1) can cause cache mismatches that hurt quality. 
+                    Recommended: <strong>0</strong> (disabled) or <strong>0.75+</strong> if enabled.
+                </div>
+            </div>
+        </div>
+    </div>
+    
     <!-- Model Settings Card -->
     <div class="card">
         <h2>⚙️ Model Configuration</h2>
@@ -375,6 +493,23 @@ class SettingsPanel {
                 <input type="number" id="maxTokens" value="${maxTokens}" 
                        min="64" max="32768" step="64"
                        onchange="saveSetting('model.maxTokens', parseInt(this.value))">
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Chat Template <small>(format for chat messages)</small></label>
+            <select id="chatTemplate" onchange="saveSetting('model.chatTemplate', this.value)">
+                <option value="chatml" \${chatTemplate === 'chatml' ? 'selected' : ''}>ChatML (Falcon-H1, OpenHermes, Yi)</option>
+                <option value="auto" \${chatTemplate === 'auto' ? 'selected' : ''}>Auto (use model's built-in template)</option>
+                <option value="llama3" \${chatTemplate === 'llama3' ? 'selected' : ''}>Llama 3 / 3.1</option>
+                <option value="mistral-v7" \${chatTemplate === 'mistral-v7' ? 'selected' : ''}>Mistral v0.7</option>
+                <option value="hermes-2-pro" \${chatTemplate === 'hermes-2-pro' ? 'selected' : ''}>Hermes 2 Pro (tool calling)</option>
+                <option value="phi4" \${chatTemplate === 'phi4' ? 'selected' : ''}>Phi-4</option>
+                <option value="gemma" \${chatTemplate === 'gemma' ? 'selected' : ''}>Gemma</option>
+                <option value="command-r" \${chatTemplate === 'command-r' ? 'selected' : ''}>Command-R</option>
+                <option value="llama2" \${chatTemplate === 'llama2' ? 'selected' : ''}>Llama 2 (legacy)</option>
+            </select>
+            <div class="help-text" style="font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px;">
+                ChatML works for most models. "Generic" tool format in logs is normal - it's the fallback tool calling format.
             </div>
         </div>
     </div>
@@ -429,7 +564,50 @@ class SettingsPanel {
     
     <script>
         const vscode = acquireVsCodeApi();
+
+        function validatePerformanceSettings() {
+            const enableCacheQuant = document.getElementById('enableCacheQuant').checked;
+            const cacheQuantSelect = document.getElementById('cacheQuant');
+            const flashAttention = document.getElementById('flashAttention');
+            const faHint = document.getElementById('fa-hint');
+
+            if (enableCacheQuant) {
+                cacheQuantSelect.style.display = 'block';
+                const currentVal = cacheQuantSelect.value;
+                // If it was f16, switch to q8_0
+                if (currentVal === 'f16') {
+                    cacheQuantSelect.value = 'q8_0';
+                }
+                saveSetting('performance.cacheQuant', cacheQuantSelect.value);
+
+                // Force Flow Attention
+                if (!flashAttention.checked) {
+                    flashAttention.checked = true;
+                    saveSetting('performance.flashAttention', true);
+                }
+                faHint.style.display = 'block';
+                flashAttention.disabled = true; // User cannot disable FA if quant is on
+            } else {
+                cacheQuantSelect.style.display = 'none';
+                saveSetting('performance.cacheQuant', 'f16');
+                faHint.style.display = 'none';
+                flashAttention.disabled = false;
+            }
+        }
         
+        function applyLowLatencyPreset() {
+            // Set conservative values for CPU execution
+            document.getElementById('batchSize').value = 512;
+            document.getElementById('ubatchSize').value = 128;
+            document.getElementById('threads').value = 0; // Auto
+            
+            saveSetting('performance.batchSize', 512);
+            saveSetting('performance.ubatchSize', 128);
+            saveSetting('model.threads', 0);
+            
+            validatePerformanceSettings();
+        }
+
         function browseModel() {
             vscode.postMessage({ command: 'browseModel' });
         }

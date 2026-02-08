@@ -39,45 +39,38 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AgentChat = void 0;
 const vscode = __importStar(require("vscode"));
-const SYSTEM_PROMPT = `You are an expert AI coding assistant running locally. You help developers write, debug, test, and understand code.
+const SYSTEM_PROMPT = `You are an autonomous coding agent. Act, don't explain.
 
-## Available Tools
-You have access to these tools to accomplish tasks:
+WORKFLOW for compiled languages (Rust, C, C++):
+1. write_file - create the code
+2. run_command - COMPILE: rustc file.rs -o program.exe
+3. run_command - EXECUTE: .\\program.exe
+4. If errors, fix and repeat
 
-1. **web_search** - Search the internet for documentation, APIs, or solutions
-2. **run_command** - Execute shell commands (tests, builds, git, etc.)
-3. **read_file** - Read file contents (code, configs, etc.)
-4. **write_file** - Create or overwrite files
-5. **edit_file** - Make targeted edits to existing files
-6. **list_directory** - Explore the file system
-7. **search_files** - Search for patterns in code (like grep)
+TOOLS:
+- write_file: create/overwrite files
+- run_command: compile AND run programs
+- edit_file: fix code errors
+- error_search: debug errors
+- web_search: research APIs
 
-## Guidelines
+RULES:
+- ALWAYS compile code before running
+- Use .\\file.exe on Windows (not ./file.exe)
+- On compiler errors: Use read_file to see the CURRENT code BEFORE fixing
+- If error_search yields no results: Paste the error into ask_expert for a direct fix.
+- If read_url fails with 404: Do NOT get stuck. Try a different query or read local files.
+- RUST RULES: No 'in' operator (use .contains()), no 'elif' (use 'else if'), always use braces.
+- SEARCH RULES: Keep error_search queries SHORT (max 10 words). Avoid pasting whole functions into search.
+- Keep iterating until code WORKS
 
-1. **Think step-by-step** - Before acting, briefly explain your reasoning
-2. **Gather context first** - Read relevant files before making changes
-3. **Be precise** - When editing files, match existing style and formatting
-4. **Test your work** - Run commands to verify changes work correctly
-5. **Handle errors gracefully** - If something fails, diagnose and try alternatives
-6. **Ask for clarification** if the request is ambiguous
-
-## Tool Call Format
-When you need to use a tool, respond with a JSON tool call in this format:
-\`\`\`tool_call
-{"name": "tool_name", "arguments": {"arg1": "value1"}}
-\`\`\`
-
-You can use multiple tools in sequence. After each tool result, continue reasoning until the task is complete.
-
-## Current Context
-- Working directory: {WORKSPACE}
-- Operating system: ${process.platform}
+Working directory: {WORKSPACE}
 `;
 class AgentChat {
     llm;
     tools;
     conversationHistory = [];
-    maxHistoryLength = 20;
+    maxHistoryLength = 10;
     constructor(llm, tools) {
         this.llm = llm;
         this.tools = tools;
@@ -87,7 +80,13 @@ class AgentChat {
         const maxIterations = config.get('agent.maxIterations', 15);
         const requireConfirmation = config.get('tools.requireConfirmation', true);
         const allowedCommands = config.get('tools.allowedCommands', ['npm', 'node', 'git', 'python']);
-        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            stream.markdown(' **No workspace folder open!**\n\nPlease open a folder first: **File  Open Folder...**');
+            vscode.window.showErrorMessage('Please open a folder or workspace before using the agent. Go to File  Open Folder...');
+            return {};
+        }
+        const workspaceRoot = workspaceFolder.uri.fsPath;
         const toolContext = {
             workspaceRoot,
             cancellationToken: token,
@@ -140,27 +139,50 @@ class AgentChat {
                     const toolName = toolCall.function.name;
                     let toolArgs;
                     try {
-                        toolArgs = JSON.parse(toolCall.function.arguments);
+                        // Sanitize smart quotes and other problematic characters before parsing
+                        let argsString = toolCall.function.arguments
+                            .replace(/[\u201c\u201d]/g, '"') // Curly double quotes -> straight
+                            .replace(/[\u2018\u2019]/g, "'") // Curly single quotes -> straight
+                            .replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, ''); // Remove incomplete unicode escapes
+                        toolArgs = JSON.parse(argsString);
                     }
                     catch {
                         toolArgs = {};
                     }
                     // Show tool execution in UI
-                    stream.markdown(`\n\n---\n**🔧 Executing:** \`${toolName}\``);
+                    stream.markdown(`\n\n---\n** Executing:** \`${toolName}\``);
                     if (Object.keys(toolArgs).length > 0) {
-                        const argsPreview = JSON.stringify(toolArgs, null, 2);
-                        if (argsPreview.length < 200) {
-                            stream.markdown(`\n\`\`\`json\n${argsPreview}\n\`\`\``);
-                        }
+                        const argEntries = Object.entries(toolArgs);
+                        const argsPreview = argEntries.length === 1
+                            ? ` \`${argEntries[0][1]}\``
+                            : `\n\`\`\`json\n${JSON.stringify(toolArgs, null, 2)}\n\`\`\``;
+                        stream.markdown(argsPreview);
                     }
                     stream.markdown('\n\n');
                     // Execute the tool
                     const result = await this.tools.executeTool(toolName, toolArgs, toolContext);
-                    // Show result preview
-                    const resultPreview = result.length > 500
-                        ? result.slice(0, 500) + `\n... (${result.length - 500} more chars)`
-                        : result;
-                    stream.markdown(`**Result:**\n\`\`\`\n${resultPreview}\n\`\`\`\n\n`);
+                    // Show concise result preview in UI (while providing full result to LLM context)
+                    let resultPreview = '';
+                    if (toolName === 'read_file') {
+                        // Extract relative path from success message if possible (e.g. "Read X lines from path")
+                        const pathMatch = result.match(/from\s+([^\n\r:\s]+)/);
+                        const displayPath = pathMatch ? pathMatch[1] : toolArgs.path;
+                        const lines = result.split('\n').filter(l => l.trim().length > 0).length;
+                        resultPreview = ` Read from \`${displayPath}\` (${lines} lines)`;
+                    }
+                    else if (toolName === 'search_files') {
+                        const matchCount = (result.match(/\[MATCH\]/g) || []).length;
+                        resultPreview = ` Found ${matchCount} matches for \`${toolArgs.pattern}\``;
+                    }
+                    else if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'append_file') {
+                        resultPreview = result.split('\n')[0]; // Just the first line (Success/Warning)
+                    }
+                    else {
+                        resultPreview = result.length > 500
+                            ? ` Success (${result.length} characters)\n\`\`\`\n${result.slice(0, 200)}...\n\`\`\``
+                            : `\`\`\`\n${result}\n\`\`\``;
+                    }
+                    stream.markdown(`**Result:** ${resultPreview}\n\n`);
                     // Add tool result to messages
                     messages.push({
                         role: 'tool',
@@ -172,15 +194,15 @@ class AgentChat {
             }
             // Warn if max iterations reached
             if (iteration >= maxIterations) {
-                stream.markdown('\n\n⚠️ *Reached maximum iterations. Task may be incomplete.*');
+                stream.markdown('\n\n *Reached maximum iterations. Task may be incomplete.*');
             }
         }
         catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            stream.markdown(`\n\n❌ **Error:** ${errorMessage}`);
+            stream.markdown(`\n\n **Error:** ${errorMessage}`);
             // Check if it's a connection error
             if (errorMessage.includes('fetch') || errorMessage.includes('ECONNREFUSED')) {
-                stream.markdown('\n\n💡 *Make sure llama.cpp server is running on the configured endpoint.*');
+                stream.markdown('\n\n *Make sure llama.cpp server is running on the configured endpoint.*');
             }
         }
         return {
@@ -217,26 +239,135 @@ class AgentChat {
                 // Skip malformed JSON
             }
         }
-        // Pattern 2: Inline JSON with "name" and "arguments" keys
+        // Pattern 2: <tool_call>...</tool_call> XML tags (Official Falcon format)
         if (calls.length === 0) {
-            const inlineJsonRegex = /\{\s*"name"\s*:\s*"([^"]+)"[\s\S]*?"arguments"\s*:\s*(\{[^}]*\})/gi;
-            while ((match = inlineJsonRegex.exec(response)) !== null) {
+            const xmlToolCallRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+            while ((match = xmlToolCallRegex.exec(response)) !== null) {
                 try {
-                    calls.push({
-                        id: `call_${Date.now()}_${calls.length}`,
-                        type: 'function',
-                        function: {
-                            name: match[1],
-                            arguments: match[2]
-                        }
-                    });
+                    // Extract and sanitize the JSON content
+                    const jsonContent = this.sanitizeJson(match[1]);
+                    const parsed = JSON.parse(jsonContent);
+                    if (parsed.name) {
+                        calls.push({
+                            id: `call_${Date.now()}_${calls.length}`,
+                            type: 'function',
+                            function: {
+                                name: parsed.name,
+                                arguments: JSON.stringify(parsed.arguments || parsed.params || {})
+                            }
+                        });
+                    }
                 }
                 catch {
-                    // Skip
+                    // Skip malformed JSON
+                }
+            }
+        }
+        // Pattern 3: Look for JSON-like structures containing "name" field
+        // Use a more robust approach that handles nested braces properly
+        if (calls.length === 0) {
+            const jsonObjects = this.extractJsonObjects(response);
+            for (const jsonStr of jsonObjects) {
+                try {
+                    // Sanitize the JSON - fix unquoted string values
+                    const sanitized = this.sanitizeJson(jsonStr);
+                    const parsed = JSON.parse(sanitized);
+                    if (parsed.name && typeof parsed.name === 'string') {
+                        calls.push({
+                            id: `call_${Date.now()}_${calls.length}`,
+                            type: 'function',
+                            function: {
+                                name: parsed.name,
+                                arguments: JSON.stringify(parsed.arguments || parsed.params || {})
+                            }
+                        });
+                    }
+                }
+                catch {
+                    // Skip malformed JSON
                 }
             }
         }
         return calls;
+    }
+    /**
+     * Sanitize malformed JSON - fix common issues from model output
+     */
+    sanitizeJson(json) {
+        // First, remove any hallucinated tool response at the end
+        // Model sometimes generates fake responses like ({"results":...})
+        const toolCallEnd = json.indexOf('</tool_call>');
+        if (toolCallEnd === -1) {
+            // Find where the main JSON ends and cut off garbage
+            let braceDepth = 0;
+            let jsonEnd = -1;
+            for (let i = 0; i < json.length; i++) {
+                if (json[i] === '{')
+                    braceDepth++;
+                else if (json[i] === '}') {
+                    braceDepth--;
+                    if (braceDepth === 0) {
+                        jsonEnd = i + 1;
+                        break;
+                    }
+                }
+            }
+            if (jsonEnd > 0) {
+                json = json.slice(0, jsonEnd);
+            }
+        }
+        let sanitized = json
+            // Convert single quotes to double quotes for JSON strings
+            // Handle: 'value' -> "value" but be careful with apostrophes
+            .replace(/'([^'\\]*)'/g, '"$1"')
+            // Fix smart quotes -> straight quotes
+            .replace(/[\u201c\u201d]/g, '"')
+            .replace(/[\u2018\u2019]/g, "'")
+            // Fix incomplete Unicode escapes: \u{...} -> \\u{...} 
+            .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u')
+            // Fix missing colons after "arguments" or "params"
+            .replace(/,\s*(arguments|params)\s*:/gi, ',"$1":')
+            .replace(/,\s*(arguments|params)\s*\{/gi, ',"$1":{')
+            // Fix unquoted property names
+            .replace(/([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
+            // Fix unquoted string values after colons
+            .replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2');
+        // Fix unescaped newlines within JSON strings (very common)
+        // We find string content and replace raw newlines with \n
+        // This is a bit risky but usually necessary for model output
+        sanitized = sanitized.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (match, p1) => {
+            return `"${p1.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
+        });
+        return sanitized;
+    }
+    /**
+     * Extract JSON objects from a string, properly handling nested braces
+     */
+    extractJsonObjects(text) {
+        const objects = [];
+        let depth = 0;
+        let start = -1;
+        for (let i = 0; i < text.length; i++) {
+            const char = text[i];
+            if (char === '{') {
+                if (depth === 0) {
+                    start = i;
+                }
+                depth++;
+            }
+            else if (char === '}') {
+                depth--;
+                if (depth === 0 && start !== -1) {
+                    const candidate = text.slice(start, i + 1);
+                    // Only include if it looks like a tool call (has "name" key)
+                    if (candidate.includes('"name"')) {
+                        objects.push(candidate);
+                    }
+                    start = -1;
+                }
+            }
+        }
+        return objects;
     }
     /**
      * Add message to conversation history with length limit

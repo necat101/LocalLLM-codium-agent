@@ -41,13 +41,16 @@ exports.BootstrapManager = void 0;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
+const https = __importStar(require("https"));
 const child_process_1 = require("child_process");
-const LLAMA_VERSION = 'b4570';
+const LLAMA_VERSION = 'b7885';
 const CMAKE_VERSION = '3.31.5';
 class BootstrapManager {
     context;
+    outputChannel;
     constructor(context) {
         this.context = context;
+        this.outputChannel = vscode.window.createOutputChannel('LLM Bootstrap');
     }
     /**
      * Get the expected path for the bootstrapped server binary
@@ -75,56 +78,73 @@ class BootstrapManager {
     /**
      * Bootstrap the server binary for the current platform
      */
-    async bootstrap() {
+    async bootstrap(type) {
         return await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: 'Bootstrapping LLM Server...',
             cancellable: false
         }, async (progress) => {
             try {
+                this.outputChannel.show();
+                this.outputChannel.appendLine(`--- Bootstrapping llama.cpp ${LLAMA_VERSION} [v0.1.1] ---`);
+                const platform = process.platform;
+                const arch = process.arch;
+                this.outputChannel.appendLine(`Platform: ${platform}, Arch: ${arch}`);
+                this.outputChannel.appendLine(`Selected Type: ${type || 'default'}`);
                 const binDir = path.join(this.context.globalStorageUri.fsPath, 'bin');
                 if (!fs.existsSync(binDir)) {
                     fs.mkdirSync(binDir, { recursive: true });
                 }
-                const platform = process.platform;
-                const arch = process.arch;
                 let downloadUrl = '';
                 let zipName = '';
                 if (platform === 'win32') {
-                    // Prefer Vulkan for most modern Windows users
-                    zipName = `llama-${LLAMA_VERSION}-bin-win-vulkan-x64.zip`;
-                    downloadUrl = `https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_VERSION}/${zipName}`;
+                    if (type === 'cuda') {
+                        zipName = `llama-${LLAMA_VERSION}-bin-win-cuda-12.4-x64.zip`;
+                    }
+                    else if (type === 'vulkan') {
+                        zipName = `llama-${LLAMA_VERSION}-bin-win-vulkan-x64.zip`;
+                    }
+                    else {
+                        zipName = `llama-${LLAMA_VERSION}-bin-win-cpu-x64.zip`;
+                    }
+                    downloadUrl = `https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${zipName}`;
                 }
                 else if (platform === 'darwin') {
                     zipName = arch === 'arm64'
-                        ? `llama-${LLAMA_VERSION}-bin-macos-arm64.zip`
-                        : `llama-${LLAMA_VERSION}-bin-macos-x64.zip`;
-                    downloadUrl = `https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_VERSION}/${zipName}`;
+                        ? `llama-${LLAMA_VERSION}-bin-macos-arm64.tar.gz`
+                        : `llama-${LLAMA_VERSION}-bin-macos-x64.tar.gz`;
+                    downloadUrl = `https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${zipName}`;
                 }
                 else if (platform === 'linux') {
-                    zipName = `llama-${LLAMA_VERSION}-bin-ubuntu-x64.zip`;
-                    downloadUrl = `https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_VERSION}/${zipName}`;
+                    zipName = `llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz`;
+                    downloadUrl = `https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${zipName}`;
                 }
                 else {
                     throw new Error(`Unsupported platform: ${platform}`);
                 }
                 const zipPath = path.join(this.context.globalStorageUri.fsPath, zipName);
                 progress.report({ message: `Downloading ${zipName}...` });
-                await this.downloadFile(downloadUrl, zipPath);
+                this.outputChannel.appendLine(`Downloading: ${downloadUrl}`);
+                await this.downloadFile(downloadUrl, zipPath, progress);
                 progress.report({ message: `Extracting ${zipName}...` });
-                await this.extractZip(zipPath, binDir);
+                this.outputChannel.appendLine(`Extracting to: ${binDir}`);
+                await this.extractAsset(zipPath, binDir);
                 // Clean up zip
                 fs.unlinkSync(zipPath);
                 // On non-windows, ensure executable bit is set
                 if (platform !== 'win32') {
                     const serverPath = this.getServerExecutablePath();
+                    this.outputChannel.appendLine(`Setting executable permission: ${serverPath}`);
                     (0, child_process_1.execSync)(`chmod +x "${serverPath}"`);
                 }
+                this.outputChannel.appendLine('✅ Bootstrap complete!');
                 vscode.window.showInformationMessage('LLM Server bootstrapped successfully!');
                 return true;
             }
             catch (error) {
-                vscode.window.showErrorMessage(`Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+                const msg = error instanceof Error ? error.message : String(error);
+                this.outputChannel.appendLine(`❌ Bootstrap failed: ${msg}`);
+                vscode.window.showErrorMessage(`Bootstrap failed: ${msg}`);
                 return false;
             }
         });
@@ -153,40 +173,93 @@ class BootstrapManager {
                 const downloadUrl = `https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${zipName}`;
                 const zipPath = path.join(this.context.globalStorageUri.fsPath, zipName);
                 progress.report({ message: `Downloading CMake ${CMAKE_VERSION}...` });
-                await this.downloadFile(downloadUrl, zipPath);
+                this.outputChannel.appendLine(`Downloading CMake: ${downloadUrl}`);
+                await this.downloadFile(downloadUrl, zipPath, progress);
                 progress.report({ message: 'Extracting CMake...' });
-                await this.extractZip(zipPath, cmakeDir);
+                this.outputChannel.appendLine(`Extracting CMake to: ${cmakeDir}`);
+                await this.extractAsset(zipPath, cmakeDir);
                 fs.unlinkSync(zipPath);
                 vscode.window.showInformationMessage('CMake bootstrapped successfully!');
                 return true;
             }
             catch (error) {
-                vscode.window.showErrorMessage(`CMake bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+                const msg = error instanceof Error ? error.message : String(error);
+                this.outputChannel.appendLine(`❌ CMake bootstrap failed: ${msg}`);
+                vscode.window.showErrorMessage(`CMake bootstrap failed: ${msg}`);
                 return false;
             }
         });
     }
-    async downloadFile(url, dest) {
-        // Use a simple fetch-based download or fallback to child_process if needed
-        // Since we are in VS Code, we can use the built-in fetch if available (Node 18+)
-        const response = await fetch(url);
-        if (!response.ok)
-            throw new Error(`Failed to download: ${response.statusText}`);
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        fs.writeFileSync(dest, buffer);
+    async downloadFile(url, dest, progress) {
+        return new Promise((resolve, reject) => {
+            const download = (targetUrl) => {
+                const request = https.get(targetUrl, (response) => {
+                    if (response.statusCode === 301 || response.statusCode === 302) {
+                        const redirectUrl = response.headers.location;
+                        if (redirectUrl) {
+                            this.outputChannel.appendLine(`Redirecting to: ${redirectUrl}`);
+                            download(redirectUrl);
+                            return;
+                        }
+                    }
+                    if (response.statusCode !== 200) {
+                        reject(new Error(`Failed to download: ${response.statusCode} ${response.statusMessage}`));
+                        return;
+                    }
+                    const totalSize = parseInt(response.headers['content-length'] || '0', 10);
+                    let downloaded = 0;
+                    const file = fs.createWriteStream(dest);
+                    response.pipe(file);
+                    response.on('data', (chunk) => {
+                        downloaded += chunk.length;
+                        if (totalSize > 0) {
+                            const percent = Math.floor((downloaded / totalSize) * 100);
+                            progress.report({ message: `Downloading... ${percent}% (${(downloaded / 1024 / 1024).toFixed(1)} MB)` });
+                        }
+                        else {
+                            progress.report({ message: `Downloading... ${(downloaded / 1024 / 1024).toFixed(1)} MB` });
+                        }
+                    });
+                    file.on('finish', () => {
+                        file.close();
+                        resolve();
+                    });
+                    file.on('error', (err) => {
+                        fs.unlinkSync(dest);
+                        reject(err);
+                    });
+                });
+                request.on('error', (err) => {
+                    reject(err);
+                });
+                request.setTimeout(60000, () => {
+                    request.destroy();
+                    reject(new Error('Download timed out'));
+                });
+            };
+            download(url);
+        });
     }
-    async extractZip(zipPath, destDir) {
+    async extractAsset(zipPath, destDir) {
         return new Promise((resolve, reject) => {
             try {
-                if (process.platform === 'win32') {
-                    // Use PowerShell to extract
-                    const cmd = `PowerShell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`;
-                    (0, child_process_1.execSync)(cmd);
+                if (zipPath.endsWith('.zip')) {
+                    if (process.platform === 'win32') {
+                        // Use PowerShell to extract
+                        const cmd = `PowerShell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`;
+                        (0, child_process_1.execSync)(cmd);
+                    }
+                    else {
+                        // Use unzip
+                        (0, child_process_1.execSync)(`unzip -o "${zipPath}" -d "${destDir}"`);
+                    }
                 }
-                else {
-                    // Use unzip
-                    (0, child_process_1.execSync)(`unzip -o "${zipPath}" -d "${destDir}"`);
+                else if (zipPath.endsWith('.tar.gz')) {
+                    // Use tar
+                    if (!fs.existsSync(destDir)) {
+                        fs.mkdirSync(destDir, { recursive: true });
+                    }
+                    (0, child_process_1.execSync)(`tar -xzf "${zipPath}" -C "${destDir}"`);
                 }
                 resolve();
             }

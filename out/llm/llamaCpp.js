@@ -117,8 +117,13 @@ class LlamaCppClient {
                     try {
                         const chunk = JSON.parse(trimmed.slice(6));
                         const delta = chunk.choices[0]?.delta;
+                        // Yield main content
                         if (delta?.content) {
                             yield delta.content;
+                        }
+                        // Some models put reasoning in a separate field
+                        if (delta?.reasoning_content) {
+                            yield delta.reasoning_content;
                         }
                         // Accumulate tool calls
                         if (delta?.tool_calls) {

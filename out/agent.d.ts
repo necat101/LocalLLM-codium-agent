@@ -18,6 +18,14 @@ export declare class AgentChat {
      */
     private parseToolCalls;
     /**
+     * Sanitize malformed JSON - fix common issues from model output
+     */
+    private sanitizeJson;
+    /**
+     * Extract JSON objects from a string, properly handling nested braces
+     */
+    private extractJsonObjects;
+    /**
      * Add message to conversation history with length limit
      */
     private addToHistory;

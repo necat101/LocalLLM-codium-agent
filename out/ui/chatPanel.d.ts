@@ -13,7 +13,9 @@ export declare class ChatViewProvider implements vscode.WebviewViewProvider {
     private messages;
     private isProcessing;
     private log;
+    private maxContextMessages;
     constructor(_extensionUri: vscode.Uri, llmClient: LlamaCppClient, tools: ToolRegistry);
+    private getSystemPrompt;
     resolveWebviewView(webviewView: vscode.WebviewView, _context: vscode.WebviewViewResolveContext, _token: vscode.CancellationToken): void;
     private handleUserMessage;
     private runAgentLoop;
