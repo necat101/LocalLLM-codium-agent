@@ -198,6 +198,21 @@
           "maximum": 1,
           "description": "Top-P (nucleus) sampling threshold"
         },
+        "agentic.expertApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for cloud model. FREE options: Groq (groq.com), Together AI, or HuggingFace Inference"
+        },
+        "agentic.expertApiEndpoint": {
+          "type": "string",
+          "default": "https://api.groq.com/openai/v1/chat/completions",
+          "description": "API endpoint. Groq (free): api.groq.com/openai/v1/chat/completions"
+        },
+        "agentic.expertModelName": {
+          "type": "string",
+          "default": "llama-3.3-70b-versatile",
+          "description": "Model name. Groq free models: llama-3.3-70b-versatile, mixtral-8x7b-32768"
+        },
         "agentic.sampling.topK": {
           "type": "number",
           "default": 40,
@@ -276,5 +291,8 @@
     "jest": "^29.0.0",
     "typescript": "^5.0.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@types/puppeteer-core": "^5.4.0",
+    "puppeteer-core": "^22.15.0"
+  }
 }

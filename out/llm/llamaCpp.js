@@ -12,10 +12,10 @@ class LlamaCppClient {
         this.config = {
             endpoint: config.endpoint || 'http://localhost:8080',
             maxTokens: config.maxTokens || 4096,
-            temperature: config.temperature ?? 0.7,
+            temperature: config.temperature ?? 0.15,
             topP: config.topP ?? 0.9,
             topK: config.topK ?? 40,
-            frequencyPenalty: config.frequencyPenalty ?? 1.1,
+            frequencyPenalty: config.frequencyPenalty ?? 0.0,
             stream: config.stream ?? true
         };
     }

@@ -3,7 +3,7 @@
   {% set system_msg = messages[0]['content'] %}  
   {%- set remaining_messages = messages[1:] %}
 {%- else %}
-  {% set system_msg = "You are Falcon, an autonomous coding agent. You respond ONLY with tool calls." %}
+  {% set system_msg = "You are Falcon, a helpful AI assistant created by Technology Innovation Institute (TII). To answer the user's question, you first think about the reasoning process and then provide the user with the answer. The reasoning process is enclosed within <think> </think> tags, i.e., <think> reasoning process here </think> answer here." %}
   {%- set remaining_messages = messages %}
 {%- endif %}
 {%- if tools %}
@@ -21,46 +21,6 @@ You may call one or more functions to assist with the user query. You are provid
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
 <tool_call>
 {"name": "<function-name>", "arguments": {<args-json-object>}}
-</tool_call>
-
-CRITICAL RULES:
-1. Output ONLY tool calls - no explanations
-2. After writing code, ALWAYS compile/run it to verify
-3. For Rust: rustc file.rs -o program.exe then .\\program.exe
-4. For compiled languages: write -> compile -> run -> fix errors
-5. RUST IS NOT PYTHON! Common mistakes:
-   - Arrays: use vec![false; 100] NOT [false for _ in range(100)]
-   - Loops: use for i in 0..100 NOT for i in range(100)
-   - Print: use println!("{}",x) NOT print(x)
-   - No list comprehensions - use .iter().map() or for loops
-6. Keep iterating until the code WORKS
-<|im_end|>
-<|im_start|>user
-write a hello world program in rust
-<|im_end|>
-<|im_start|>assistant
-<tool_call>
-{"name": "write_file", "arguments": {"path": "hello.rs", "content": "fn main() {\n    println!(\"Hello, World!\");\n}"}}
-</tool_call>
-<|im_end|>
-<|im_start|>user
-<tool_response>
-Successfully wrote hello.rs
-</tool_response>
-<|im_end|>
-<|im_start|>assistant
-<tool_call>
-{"name": "run_command", "arguments": {"command": "rustc hello.rs -o hello.exe"}}
-</tool_call>
-<|im_end|>
-<|im_start|>user
-<tool_response>
-(Command completed with no output)
-</tool_response>
-<|im_end|>
-<|im_start|>assistant
-<tool_call>
-{"name": "run_command", "arguments": {"command": ".\\hello.exe"}}
 </tool_call>
 <|im_end|>
 {%- else %}

@@ -39,29 +39,14 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AgentChat = void 0;
 const vscode = __importStar(require("vscode"));
-const SYSTEM_PROMPT = `You are an autonomous coding agent. Act, don't explain.
+const SYSTEM_PROMPT = `You are an autonomous coding agent. You respond ONLY with tool calls, never with text or explanations.
 
-WORKFLOW for compiled languages (Rust, C, C++):
-1. write_file - create the code
-2. run_command - COMPILE: rustc file.rs -o program.exe
-3. run_command - EXECUTE: .\\program.exe
-4. If errors, fix and repeat
-
-TOOLS:
-- write_file: create/overwrite files
-- run_command: compile AND run programs
-- edit_file: fix code errors
-- error_search: debug errors
-- web_search: research APIs
+WORKFLOW: write_file -> run_command (compile) -> run_command (execute) -> fix errors if any.
 
 RULES:
-- ALWAYS compile code before running
-- Use .\\file.exe on Windows (not ./file.exe)
-- On compiler errors: Use read_file to see the CURRENT code BEFORE fixing
-- If error_search yields no results: Paste the error into ask_expert for a direct fix.
-- If read_url fails with 404: Do NOT get stuck. Try a different query or read local files.
-- RUST RULES: No 'in' operator (use .contains()), no 'elif' (use 'else if'), always use braces.
-- SEARCH RULES: Keep error_search queries SHORT (max 10 words). Avoid pasting whole functions into search.
+- For Rust: rustc file.rs -o program.exe then .\\program.exe
+- On errors: read_file first, then edit_file to fix
+- Rust is NOT Python: use vec![], for i in 0..n, println!()
 - Keep iterating until code WORKS
 
 Working directory: {WORKSPACE}
@@ -111,10 +96,23 @@ class AgentChat {
                 // Get LLM response
                 let fullResponse = '';
                 const pendingToolCalls = [];
+                let inThinkBlock = false;
                 // Stream the response
                 for await (const chunk of this.llm.streamChat(messages, this.tools.getToolDefinitions(), (toolCalls) => pendingToolCalls.push(...toolCalls))) {
                     fullResponse += chunk;
-                    stream.markdown(chunk);
+                    // Filter out <think> blocks from being shown to user
+                    if (chunk.includes('<think>')) {
+                        inThinkBlock = true;
+                    }
+                    if (!inThinkBlock) {
+                        // Don't stream <tool_call> tags or raw JSON to user
+                        if (!chunk.includes('<tool_call>') && !chunk.includes('</tool_call>') && !chunk.startsWith('{"name"')) {
+                            stream.markdown(chunk);
+                        }
+                    }
+                    if (chunk.includes('</think>')) {
+                        inThinkBlock = false;
+                    }
                 }
                 // Parse tool calls from the response text (for models that don't use native tool calling)
                 const parsedToolCalls = this.parseToolCalls(fullResponse);
