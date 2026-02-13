@@ -260,22 +260,14 @@ class ServerManager {
                 args.push('-ctk', cacheQuant);
                 args.push('-ctv', cacheQuant);
             }
-            // Chat template handling with tool support
-            // Use custom template file for ChatML-based models (Falcon-H1, Qwen, etc.) to enable tool calling
-            const extensionPath = this.context.extensionPath;
-            const customTemplatePath = path.join(extensionPath, 'templates', 'falcon-h1-tools.jinja');
-            // Use custom template file if it exists (takes precedence over built-in templates)
-            if (chatTemplate === 'chatml' && require('fs').existsSync(customTemplatePath)) {
-                // Use ONLY the custom template file, not both flags
-                args.push('--chat-template-file', customTemplatePath);
-                this.outputChannel.appendLine(`Using custom tool template: ${customTemplatePath}`);
-            }
-            else if (chatTemplate && chatTemplate !== 'auto') {
-                // Fall back to built-in template
+            // Chat template handling
+            // IMPORTANT: Do NOT use custom Jinja template or --jinja flag!
+            // llama.cpp detects <tool_call> in templates and overrides with "Hermes 2 Pro" format,
+            // which completely corrupts the prompt formatting for Falcon H1.
+            // Instead, tools are embedded directly in the system prompt (see agent.ts).
+            if (chatTemplate && chatTemplate !== 'auto') {
                 args.push('--chat-template', chatTemplate);
             }
-            // Enable Jinja template processing for tool calling
-            args.push('--jinja');
             this.serverProcess = (0, child_process_1.spawn)(serverPath, args, {
                 cwd: path.dirname(serverPath)
             });

@@ -2,7 +2,7 @@
   "name": "vscodium-agentic",
   "displayName": "Agentic Coding Assistant",
   "description": "Local LLM-powered agentic coding with llama.cpp",
-  "version": "0.1.2",
+  "version": "0.1.6",
   "publisher": "local",
   "engines": {
     "vscode": "^1.80.0"

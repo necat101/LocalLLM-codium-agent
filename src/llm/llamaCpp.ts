@@ -75,7 +75,7 @@ export class LlamaCppClient {
         this.config = {
             endpoint: config.endpoint || 'http://localhost:8080',
             maxTokens: config.maxTokens || 4096,
-            temperature: config.temperature ?? 0.15,
+            temperature: config.temperature ?? 0.0,
             topP: config.topP ?? 0.9,
             topK: config.topK ?? 40,
             frequencyPenalty: config.frequencyPenalty ?? 0.0,
@@ -149,6 +149,10 @@ export class LlamaCppClient {
         if (tools && tools.length > 0) {
             requestBody.tools = tools;
             requestBody.tool_choice = 'auto';
+        } else {
+            // Explicitly disable server-side tool parsing
+            // We parse tool calls client-side to handle malformed JSON gracefully
+            requestBody.tool_choice = 'none';
         }
 
         const response = await fetch(`${this.config.endpoint}/v1/chat/completions`, {
@@ -162,8 +166,31 @@ export class LlamaCppClient {
         });
 
         if (!response.ok) {
-            const error = await response.text();
-            throw new Error(`LLM API error: ${response.status} - ${error}`);
+            const errorText = await response.text();
+
+            // Special handling: llama.cpp fails to parse tool call JSON (broken unicode, etc.)
+            // The error body contains the actual model output - extract and return it
+            if (response.status === 500 && errorText.includes('Failed to parse tool call arguments')) {
+                // Extract the raw content from the error message
+                // The error contains the model's output as a JSON string with escaped chars
+                const contentMatch = errorText.match(/"last read: \\"([\s\S]*?)\\"/);
+                if (contentMatch) {
+                    let rawContent = contentMatch[1]
+                        .replace(/\\n/g, '\n')
+                        .replace(/\\t/g, '\t')
+                        .replace(/\\"/g, '"')
+                        .replace(/\\\\/g, '\\')
+                        // Fix broken unicode escapes that caused the crash
+                        .replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, '')
+                        .replace(/\\u00b1/g, '±');
+
+                    // Wrap as a code block so agent.ts code extraction picks it up
+                    yield '```rust\n' + rawContent + '\n```';
+                    return;
+                }
+            }
+
+            throw new Error(`LLM API error: ${response.status} - ${errorText}`);
         }
 
         const reader = response.body?.getReader();

@@ -39,23 +39,27 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AgentChat = void 0;
 const vscode = __importStar(require("vscode"));
-const SYSTEM_PROMPT = `You are an autonomous coding agent. You respond ONLY with tool calls, never with text or explanations.
+const SYSTEM_PROMPT = `You are Falcon, a helpful AI assistant created by Technology Innovation Institute (TII). To answer the user's question, you first think about the reasoning process and then provide the user with the answer. The reasoning process is enclosed within <think> </think> tags, i.e., <think> reasoning process here </think> answer here.
 
-WORKFLOW: write_file -> run_command (compile) -> run_command (execute) -> fix errors if any.
-
-RULES:
-- For Rust: rustc file.rs -o program.exe then .\\program.exe
-- On errors: read_file first, then edit_file to fix
-- Rust is NOT Python: use vec![], for i in 0..n, println!()
-- Keep iterating until code WORKS
+# Tools
+You may call one or more functions to assist with the user query. You are provided with function signatures within <tools></tools> XML tags.
+<tools>
+{TOOL_DEFINITIONS}
+</tools>
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
 
 Working directory: {WORKSPACE}
-`;
+
+Respond ONLY with a tool_call. No explanations.`;
 class AgentChat {
     llm;
     tools;
     conversationHistory = [];
     maxHistoryLength = 10;
+    hasWrittenFile = false;
     constructor(llm, tools) {
         this.llm = llm;
         this.tools = tools;
@@ -67,8 +71,8 @@ class AgentChat {
         const allowedCommands = config.get('tools.allowedCommands', ['npm', 'node', 'git', 'python']);
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
-            stream.markdown(' **No workspace folder open!**\n\nPlease open a folder first: **File  Open Folder...**');
-            vscode.window.showErrorMessage('Please open a folder or workspace before using the agent. Go to File  Open Folder...');
+            stream.markdown('❌ **No workspace folder open!**\n\nPlease open a folder first: **File → Open Folder...**');
+            vscode.window.showErrorMessage('Please open a folder or workspace before using the agent.');
             return {};
         }
         const workspaceRoot = workspaceFolder.uri.fsPath;
@@ -78,7 +82,17 @@ class AgentChat {
             requireConfirmation,
             allowedCommands
         };
-        // Build system prompt with workspace info
+        // Auto-chain context bypasses confirmation for internal compile/run commands
+        const autoChainContext = {
+            workspaceRoot,
+            cancellationToken: token,
+            requireConfirmation: false,
+            allowedCommands: ['rustc', 'gcc', 'g++', 'python', 'node', 'npm', 'git', ...allowedCommands]
+        };
+        // Core tools list for validation
+        const coreTools = ['write_file', 'run_command', 'read_file', 'edit_file', 'web_search'];
+        // Reset session state
+        this.hasWrittenFile = false;
         const systemPrompt = SYSTEM_PROMPT.replace('{WORKSPACE}', workspaceRoot);
         // Build conversation messages
         const messages = [
@@ -96,59 +110,97 @@ class AgentChat {
                 // Get LLM response
                 let fullResponse = '';
                 const pendingToolCalls = [];
-                let inThinkBlock = false;
-                // Stream the response
-                for await (const chunk of this.llm.streamChat(messages, this.tools.getToolDefinitions(), (toolCalls) => pendingToolCalls.push(...toolCalls))) {
+                // Stream the response - suppress all text output
+                for await (const chunk of this.llm.streamChat(messages, undefined, (toolCalls) => pendingToolCalls.push(...toolCalls))) {
                     fullResponse += chunk;
-                    // Filter out <think> blocks from being shown to user
-                    if (chunk.includes('<think>')) {
-                        inThinkBlock = true;
-                    }
-                    if (!inThinkBlock) {
-                        // Don't stream <tool_call> tags or raw JSON to user
-                        if (!chunk.includes('<tool_call>') && !chunk.includes('</tool_call>') && !chunk.startsWith('{"name"')) {
-                            stream.markdown(chunk);
-                        }
-                    }
-                    if (chunk.includes('</think>')) {
-                        inThinkBlock = false;
-                    }
                 }
-                // Parse tool calls from the response text (for models that don't use native tool calling)
+                // Parse tool calls from the response text
                 const parsedToolCalls = this.parseToolCalls(fullResponse);
                 const allToolCalls = [...pendingToolCalls, ...parsedToolCalls];
-                // If no tool calls, we're done
+                // If no tool calls found, check for code blocks in the text
                 if (allToolCalls.length === 0) {
-                    // Save to conversation history
+                    // Try to extract code from markdown response
+                    const codeBlockMatch = fullResponse.match(/```(?:rust|rs|c|cpp|python|py|javascript|js)\s*\n([\s\S]*?)```/);
+                    if (codeBlockMatch && codeBlockMatch[1].trim().length > 20) {
+                        const langTag = fullResponse.match(/```(\w+)/)?.[1] || 'rs';
+                        const extMap = { rust: 'rs', rs: 'rs', c: 'c', cpp: 'cpp', python: 'py', py: 'py', javascript: 'js', js: 'js' };
+                        const ext = extMap[langTag] || 'rs';
+                        const promptLower = request.prompt.toLowerCase();
+                        let fileName = `main.${ext}`;
+                        if (promptLower.includes('atkins'))
+                            fileName = `atkins_sieve.${ext}`;
+                        else if (promptLower.includes('eratosthenes'))
+                            fileName = `eratosthenes_sieve.${ext}`;
+                        else if (promptLower.includes('fibonacci'))
+                            fileName = `fibonacci.${ext}`;
+                        else if (promptLower.includes('hello'))
+                            fileName = `hello_world.${ext}`;
+                        else if (promptLower.includes('sort'))
+                            fileName = `sort.${ext}`;
+                        stream.markdown(`\n📝 *Extracted code from response, writing to \`${fileName}\`...*\n`);
+                        const writeResult = await this.tools.executeTool('write_file', { path: fileName, content: codeBlockMatch[1].trim() }, toolContext);
+                        stream.markdown(`**Result:** ${writeResult.split('\n')[0]}\n\n`);
+                        if (writeResult.includes('Successfully wrote')) {
+                            this.hasWrittenFile = true;
+                            await this.autoChainCompileRun(fileName, stream, autoChainContext, messages, token);
+                        }
+                        break;
+                    }
+                    // No code blocks either - just stop
+                    if (iteration > 1) {
+                        stream.markdown(`\n✅ *Task complete.*\n`);
+                        break;
+                    }
                     this.addToHistory({ role: 'user', content: request.prompt });
                     this.addToHistory({ role: 'assistant', content: fullResponse });
+                    stream.markdown(fullResponse);
                     break;
                 }
-                // Add assistant message with tool calls
-                messages.push({
-                    role: 'assistant',
-                    content: fullResponse,
-                    tool_calls: allToolCalls
-                });
-                // Execute each tool call
+                // Add assistant message with tool calls embedded in content
+                let assistantContent = fullResponse;
+                if (!assistantContent.includes('<tool_call>')) {
+                    for (const tc of allToolCalls) {
+                        assistantContent += `\n<tool_call>\n{"name": "${tc.function.name}", "arguments": ${tc.function.arguments}}\n</tool_call>`;
+                    }
+                }
+                messages.push({ role: 'assistant', content: assistantContent });
+                // Execute each tool call and collect results for auto-chaining
+                const completedWriteFiles = [];
                 for (const toolCall of allToolCalls) {
                     if (token.isCancellationRequested)
                         break;
                     const toolName = toolCall.function.name;
+                    // Block non-core tools
+                    if (!coreTools.includes(toolName)) {
+                        const result = `Error: Tool "${toolName}" is not available. Use write_file to create code.`;
+                        stream.markdown(`⚠️ *Blocked: ${toolName} is not available. Use write_file.*\n`);
+                        messages.push({ role: 'user', content: `<tool_response>\n${result}\n</tool_response>` });
+                        continue;
+                    }
                     let toolArgs;
                     try {
-                        // Sanitize smart quotes and other problematic characters before parsing
                         let argsString = toolCall.function.arguments
-                            .replace(/[\u201c\u201d]/g, '"') // Curly double quotes -> straight
-                            .replace(/[\u2018\u2019]/g, "'") // Curly single quotes -> straight
-                            .replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, ''); // Remove incomplete unicode escapes
+                            .replace(/[\u201c\u201d]/g, '"')
+                            .replace(/[\u2018\u2019]/g, "'")
+                            .replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, '');
                         toolArgs = JSON.parse(argsString);
                     }
                     catch {
                         toolArgs = {};
                     }
+                    // ENFORCE: write_file must come before run_command (except for enumeration)
+                    if (toolName === 'run_command' && !this.hasWrittenFile) {
+                        const cmd = (toolArgs.command || '').toLowerCase();
+                        const isEnumerate = ['ls', 'dir', 'pwd', 'env', 'whoami', 'ver', 'rustc --version', 'node --version', 'python --version', 'gcc --version', 'g++ --version'].some(e => cmd.includes(e));
+                        if (!isEnumerate) {
+                            const result = `Error: You must use write_file FIRST to create the code before running commands like compilation or execution. However, you MAY use run_command for environment enumeration (e.g., ls, dir, env).`;
+                            stream.markdown(`⚠️ *Blocked: Only enumeration commands allowed before write_file.*\n`);
+                            messages.push({ role: 'user', content: `<tool_response>\n${result}\n</tool_response>` });
+                            continue;
+                        }
+                    }
                     // Show tool execution in UI
-                    stream.markdown(`\n\n---\n** Executing:** \`${toolName}\``);
+                    stream.markdown(`\n\n---\n**🔧 Executing:** \`${toolName}\``);
                     if (Object.keys(toolArgs).length > 0) {
                         const argEntries = Object.entries(toolArgs);
                         const argsPreview = argEntries.length === 1
@@ -159,21 +211,16 @@ class AgentChat {
                     stream.markdown('\n\n');
                     // Execute the tool
                     const result = await this.tools.executeTool(toolName, toolArgs, toolContext);
-                    // Show concise result preview in UI (while providing full result to LLM context)
+                    // Show concise result preview
                     let resultPreview = '';
                     if (toolName === 'read_file') {
-                        // Extract relative path from success message if possible (e.g. "Read X lines from path")
                         const pathMatch = result.match(/from\s+([^\n\r:\s]+)/);
                         const displayPath = pathMatch ? pathMatch[1] : toolArgs.path;
-                        const lines = result.split('\n').filter(l => l.trim().length > 0).length;
+                        const lines = result.split('\n').filter((l) => l.trim().length > 0).length;
                         resultPreview = ` Read from \`${displayPath}\` (${lines} lines)`;
                     }
-                    else if (toolName === 'search_files') {
-                        const matchCount = (result.match(/\[MATCH\]/g) || []).length;
-                        resultPreview = ` Found ${matchCount} matches for \`${toolArgs.pattern}\``;
-                    }
                     else if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'append_file') {
-                        resultPreview = result.split('\n')[0]; // Just the first line (Success/Warning)
+                        resultPreview = result.split('\n')[0];
                     }
                     else {
                         resultPreview = result.length > 500
@@ -181,26 +228,33 @@ class AgentChat {
                             : `\`\`\`\n${result}\n\`\`\``;
                     }
                     stream.markdown(`**Result:** ${resultPreview}\n\n`);
+                    // Track successful write_file calls for auto-chaining
+                    if (toolName === 'write_file' && result.includes('Successfully wrote')) {
+                        this.hasWrittenFile = true;
+                        const filePath = toolArgs.path || '';
+                        if (filePath)
+                            completedWriteFiles.push(filePath);
+                    }
                     // Add tool result to messages
-                    messages.push({
-                        role: 'tool',
-                        tool_call_id: toolCall.id,
-                        content: result,
-                        name: toolName
-                    });
+                    messages.push({ role: 'user', content: `<tool_response>\n${result}\n</tool_response>` });
+                }
+                // AUTO-CHAIN: After write_file on code files, automatically compile and run
+                if (completedWriteFiles.length > 0) {
+                    const lastFile = completedWriteFiles[completedWriteFiles.length - 1];
+                    await this.autoChainCompileRun(lastFile, stream, autoChainContext, messages, token);
+                    break;
                 }
             }
             // Warn if max iterations reached
             if (iteration >= maxIterations) {
-                stream.markdown('\n\n *Reached maximum iterations. Task may be incomplete.*');
+                stream.markdown('\n\n⚠ *Reached maximum iterations. Task may be incomplete.*');
             }
         }
         catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-            stream.markdown(`\n\n **Error:** ${errorMessage}`);
-            // Check if it's a connection error
+            stream.markdown(`\n\n❌ **Error:** ${errorMessage}`);
             if (errorMessage.includes('fetch') || errorMessage.includes('ECONNREFUSED')) {
-                stream.markdown('\n\n *Make sure llama.cpp server is running on the configured endpoint.*');
+                stream.markdown('\n\n💡 *Make sure llama.cpp server is running on the configured endpoint.*');
             }
         }
         return {
@@ -211,8 +265,69 @@ class AgentChat {
         };
     }
     /**
+     * Auto-chain: compile and run a code file
+     * Uses a permissive context that bypasses command confirmation
+     */
+    async autoChainCompileRun(filePath, stream, ctx, messages, token) {
+        if (token.isCancellationRequested)
+            return;
+        const ext = filePath.split('.').pop()?.toLowerCase();
+        const baseName = filePath.replace(/\.[^.]+$/, '');
+        let compileCmd = '';
+        let runCmd = '';
+        if (ext === 'rs') {
+            compileCmd = `rustc "${filePath}" -o "${baseName}.exe"`;
+            runCmd = `".\\${baseName}.exe"`;
+        }
+        else if (ext === 'c') {
+            compileCmd = `gcc "${filePath}" -o "${baseName}.exe"`;
+            runCmd = `".\\${baseName}.exe"`;
+        }
+        else if (ext === 'cpp') {
+            compileCmd = `g++ "${filePath}" -o "${baseName}.exe"`;
+            runCmd = `".\\${baseName}.exe"`;
+        }
+        else if (ext === 'py') {
+            runCmd = `python "${filePath}"`;
+        }
+        else if (ext === 'js') {
+            runCmd = `node "${filePath}"`;
+        }
+        // Compile if needed
+        if (compileCmd) {
+            stream.markdown(`\n---\n**🔨 Auto-compiling:** \`${compileCmd}\`\n\n`);
+            try {
+                const compileResult = await this.tools.executeTool('run_command', { command: compileCmd }, ctx);
+                const compileSuccess = !compileResult.toLowerCase().includes('error');
+                stream.markdown(`**Result:** \`\`\`\n${compileResult.slice(0, 500)}\n\`\`\`\n\n`);
+                messages.push({ role: 'user', content: `<tool_response>\nCompile result:\n${compileResult}\n</tool_response>` });
+                if (!compileSuccess) {
+                    stream.markdown(`⚠️ *Compilation failed.*\n`);
+                    return;
+                }
+            }
+            catch (e) {
+                stream.markdown(`⚠️ *Compile error: ${e instanceof Error ? e.message : 'unknown'}*\n`);
+                return;
+            }
+        }
+        // Run if we have a run command
+        if (runCmd) {
+            stream.markdown(`\n---\n**▶️ Auto-running:** \`${runCmd}\`\n\n`);
+            try {
+                const runResult = await this.tools.executeTool('run_command', { command: runCmd }, ctx);
+                stream.markdown(`**Output:** \`\`\`\n${runResult.slice(0, 500)}\n\`\`\`\n\n`);
+                messages.push({ role: 'user', content: `<tool_response>\nExecution result:\n${runResult}\n</tool_response>` });
+            }
+            catch (e) {
+                stream.markdown(`⚠️ *Run error: ${e instanceof Error ? e.message : 'unknown'}*\n`);
+                return;
+            }
+        }
+        stream.markdown(`\n✅ *Done!*\n`);
+    }
+    /**
      * Parse tool calls from model output text
-     * Supports various formats including markdown code blocks
      */
     parseToolCalls(response) {
         const calls = [];
@@ -233,16 +348,13 @@ class AgentChat {
                     });
                 }
             }
-            catch {
-                // Skip malformed JSON
-            }
+            catch { /* skip */ }
         }
-        // Pattern 2: <tool_call>...</tool_call> XML tags (Official Falcon format)
+        // Pattern 2: <tool_call>...</tool_call> XML tags
         if (calls.length === 0) {
             const xmlToolCallRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
             while ((match = xmlToolCallRegex.exec(response)) !== null) {
                 try {
-                    // Extract and sanitize the JSON content
                     const jsonContent = this.sanitizeJson(match[1]);
                     const parsed = JSON.parse(jsonContent);
                     if (parsed.name) {
@@ -256,18 +368,14 @@ class AgentChat {
                         });
                     }
                 }
-                catch {
-                    // Skip malformed JSON
-                }
+                catch { /* skip */ }
             }
         }
-        // Pattern 3: Look for JSON-like structures containing "name" field
-        // Use a more robust approach that handles nested braces properly
+        // Pattern 3: Raw JSON objects with "name" field
         if (calls.length === 0) {
             const jsonObjects = this.extractJsonObjects(response);
             for (const jsonStr of jsonObjects) {
                 try {
-                    // Sanitize the JSON - fix unquoted string values
                     const sanitized = this.sanitizeJson(jsonStr);
                     const parsed = JSON.parse(sanitized);
                     if (parsed.name && typeof parsed.name === 'string') {
@@ -281,113 +389,81 @@ class AgentChat {
                         });
                     }
                 }
-                catch {
-                    // Skip malformed JSON
-                }
+                catch { /* skip */ }
             }
         }
         return calls;
     }
     /**
-     * Sanitize malformed JSON - fix common issues from model output
+     * Sanitize malformed JSON from model output
      */
     sanitizeJson(json) {
-        // First, remove any hallucinated tool response at the end
-        // Model sometimes generates fake responses like ({"results":...})
-        const toolCallEnd = json.indexOf('</tool_call>');
-        if (toolCallEnd === -1) {
-            // Find where the main JSON ends and cut off garbage
-            let braceDepth = 0;
-            let jsonEnd = -1;
-            for (let i = 0; i < json.length; i++) {
-                if (json[i] === '{')
-                    braceDepth++;
-                else if (json[i] === '}') {
-                    braceDepth--;
-                    if (braceDepth === 0) {
-                        jsonEnd = i + 1;
-                        break;
-                    }
+        // Cut off at first complete JSON object
+        let braceDepth = 0;
+        let jsonEnd = -1;
+        for (let i = 0; i < json.length; i++) {
+            if (json[i] === '{')
+                braceDepth++;
+            else if (json[i] === '}') {
+                braceDepth--;
+                if (braceDepth === 0) {
+                    jsonEnd = i + 1;
+                    break;
                 }
             }
-            if (jsonEnd > 0) {
-                json = json.slice(0, jsonEnd);
-            }
         }
+        if (jsonEnd > 0)
+            json = json.slice(0, jsonEnd);
         let sanitized = json
-            // Convert single quotes to double quotes for JSON strings
-            // Handle: 'value' -> "value" but be careful with apostrophes
             .replace(/'([^'\\]*)'/g, '"$1"')
-            // Fix smart quotes -> straight quotes
             .replace(/[\u201c\u201d]/g, '"')
             .replace(/[\u2018\u2019]/g, "'")
-            // Fix incomplete Unicode escapes: \u{...} -> \\u{...} 
             .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u')
-            // Fix missing colons after "arguments" or "params"
             .replace(/,\s*(arguments|params)\s*:/gi, ',"$1":')
             .replace(/,\s*(arguments|params)\s*\{/gi, ',"$1":{')
-            // Fix unquoted property names
             .replace(/([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
-            // Fix unquoted string values after colons
             .replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2');
-        // Fix unescaped newlines within JSON strings (very common)
-        // We find string content and replace raw newlines with \n
-        // This is a bit risky but usually necessary for model output
-        sanitized = sanitized.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (match, p1) => {
+        // Fix unescaped newlines within JSON strings
+        sanitized = sanitized.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_match, p1) => {
             return `"${p1.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
         });
         return sanitized;
     }
     /**
-     * Extract JSON objects from a string, properly handling nested braces
+     * Extract JSON objects from text, handling nested braces
      */
     extractJsonObjects(text) {
         const objects = [];
         let depth = 0;
         let start = -1;
         for (let i = 0; i < text.length; i++) {
-            const char = text[i];
-            if (char === '{') {
-                if (depth === 0) {
+            if (text[i] === '{') {
+                if (depth === 0)
                     start = i;
-                }
                 depth++;
             }
-            else if (char === '}') {
+            else if (text[i] === '}') {
                 depth--;
                 if (depth === 0 && start !== -1) {
                     const candidate = text.slice(start, i + 1);
-                    // Only include if it looks like a tool call (has "name" key)
-                    if (candidate.includes('"name"')) {
+                    if (candidate.includes('"name"'))
                         objects.push(candidate);
-                    }
                     start = -1;
                 }
             }
         }
         return objects;
     }
-    /**
-     * Add message to conversation history with length limit
-     */
     addToHistory(message) {
         this.conversationHistory.push(message);
-        // Trim old messages if too long
         while (this.conversationHistory.length > this.maxHistoryLength * 2) {
-            // Remove oldest pair (user + assistant)
             this.conversationHistory.shift();
             this.conversationHistory.shift();
         }
     }
-    /**
-     * Clear conversation history
-     */
     clearHistory() {
         this.conversationHistory = [];
     }
-    /**
-     * Get current conversation history
-     */
     getHistory() {
         return [...this.conversationHistory];
     }

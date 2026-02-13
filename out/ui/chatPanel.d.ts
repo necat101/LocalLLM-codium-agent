@@ -14,15 +14,15 @@ export declare class ChatViewProvider implements vscode.WebviewViewProvider {
     private isProcessing;
     private log;
     private maxContextMessages;
+    private hasWrittenFile;
     constructor(_extensionUri: vscode.Uri, llmClient: LlamaCppClient, tools: ToolRegistry);
     private getSystemPrompt;
     resolveWebviewView(webviewView: vscode.WebviewView, _context: vscode.WebviewViewResolveContext, _token: vscode.CancellationToken): void;
     private handleUserMessage;
     private runAgentLoop;
     private parseToolCalls;
+    private sanitizeJson;
     private postUpdate;
     private getHtmlContent;
-    private renderMessage;
-    private formatContent;
 }
 //# sourceMappingURL=chatPanel.d.ts.map

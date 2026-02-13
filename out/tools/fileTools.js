@@ -499,20 +499,27 @@ function getFileTools() {
         },
         {
             name: 'search_files',
-            description: 'Search for text patterns in files.',
+            description: 'Search for TEXT content inside files. NOT for listing files by extension.',
             parameters: {
                 type: 'object',
                 properties: {
-                    pattern: { type: 'string', description: 'Search pattern' },
-                    directory: { type: 'string', description: 'Directory to search' },
-                    filePattern: { type: 'string', description: 'File pattern' }
+                    pattern: { type: 'string', description: 'Text to search for INSIDE files (e.g. "fn main", "TODO", "import"). NOT a filename glob.' },
+                    directory: { type: 'string', description: 'Directory to search in' },
+                    filePattern: { type: 'string', description: 'Optional: filter by file extension (e.g. ".rs", ".py")' }
                 },
                 required: ['pattern', 'directory']
             },
             execute: async (args, context) => {
-                const searchPattern = args.pattern;
+                let searchPattern = args.pattern;
                 const directory = resolvePath(args.directory, context.workspaceRoot);
-                const filePattern = args.filePattern;
+                let filePattern = args.filePattern;
+                // Auto-correct: if the search pattern looks like a file glob (e.g. "*.rs"),
+                // the model likely wants to find files of that type, not search for that text
+                if (searchPattern.includes('*') || searchPattern.includes('?')) {
+                    // Shift the glob to filePattern and search for any content
+                    filePattern = searchPattern.replace('*', '');
+                    searchPattern = '.';
+                }
                 try {
                     const results = await searchInFiles(directory, searchPattern, filePattern);
                     if (results.length === 0)
