@@ -38,21 +38,39 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ChatViewProvider = void 0;
 const vscode = __importStar(require("vscode"));
-const SHARED_SYSTEM_PROMPT = `You are Falcon, a helpful AI assistant created by Technology Innovation Institute (TII).
+const SHARED_SYSTEM_PROMPT = `You are Falcon, an expert AI coding assistant. You solve tasks by using tools.
 
-## Guidelines
-1. Use <think> </think> tags for your internal reasoning process.
-2. If you need to use a tool, first think in <think> tags, then provide ONLY the <tool_call> tags. Do NOT provide a final answer until you have the tool results.
-3. If you have the final answer, provide it after your <think> process.
+## Critical Rules
+- When asked to write code, IMMEDIATELY call write_file. Do NOT write code in your response.
+- When asked about existing code, call read_file first.
+- To compile or run code, call run_command.
+- NEVER explain how you would implement something. Just DO it with tools.
+- After receiving tool results, either call another tool or give a SHORT final answer.
 
-# Tools
-You may call one or more functions to assist with the user query. You are provided with function signatures within <tools></tools> XML tags.
+## Available Tools
 <tools>
 {TOOL_DEFINITIONS}
 </tools>
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+
+## Tool Call Format
+You MUST use this EXACT format. Every <tool_call> MUST have a matching </tool_call>.
 <tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
+{"name": "tool_name", "arguments": {"param": "value"}}
+</tool_call>
+
+IMPORTANT: Always close each tool call with </tool_call> BEFORE starting the next one.
+
+## Example: Single tool
+<tool_call>
+{"name": "write_file", "arguments": {"path": "hello.py", "content": "print('Hello!')"}}
+</tool_call>
+
+## Example: Multiple tools
+<tool_call>
+{"name": "write_file", "arguments": {"path": "main.rs", "content": "fn main() { println!(\\"Hello\\"); }"}}
+</tool_call>
+<tool_call>
+{"name": "run_command", "arguments": {"command": "rustc main.rs && ./main"}}
 </tool_call>
 
 Working directory: {WORKSPACE}`;
@@ -143,63 +161,100 @@ class ChatViewProvider {
             }
         });
         this.hasWrittenFile = false;
-        while (iterations < maxIterations && this.isProcessing) {
-            iterations++;
-            let assistantMsg = { role: 'assistant', content: '' };
-            this.messages.push(assistantMsg);
-            this.postUpdate();
-            let toolCallsFromStream = [];
-            try {
-                let historyToKeep = this.messages.slice(0, -1);
-                if (historyToKeep.length > this.maxContextMessages) {
-                    historyToKeep = [historyToKeep[0], ...historyToKeep.slice(-this.maxContextMessages + 1)];
+        let consecutiveFailures = 0;
+        try {
+            while (iterations < maxIterations && this.isProcessing) {
+                iterations++;
+                let assistantMsg = { role: 'assistant', content: '' };
+                this.messages.push(assistantMsg);
+                this.postUpdate();
+                let toolCallsFromStream = [];
+                try {
+                    let historyToKeep = this.messages.slice(0, -1);
+                    if (historyToKeep.length > this.maxContextMessages) {
+                        historyToKeep = [historyToKeep[0], ...historyToKeep.slice(-this.maxContextMessages + 1)];
+                    }
+                    // Force tool call by pre-filling the assistant response
+                    // This structurally prevents the model from rambling
+                    const toolCallPrefix = '<tool_call>\n{"name": "';
+                    const prefixedMessages = [
+                        ...historyToKeep,
+                        { role: 'assistant', content: toolCallPrefix }
+                    ];
+                    let toolCallText = '';
+                    const stream = this.llmClient.streamChat(prefixedMessages, undefined, (tc) => { toolCallsFromStream = tc; }, ['</tool_call>'] // Only stop at closing tag
+                    );
+                    for await (const chunk of stream) {
+                        toolCallText += chunk;
+                        // Show generation progress
+                        assistantMsg.content = '⚡ Generating...\n' + toolCallPrefix + toolCallText;
+                        this._view?.webview.postMessage({
+                            command: 'streamChunk',
+                            content: assistantMsg.content
+                        });
+                    }
+                    // Reconstruct: prefix + generated text
+                    const fullResponse = toolCallPrefix + toolCallText;
+                    assistantMsg.content = fullResponse;
+                    const parsedCalls = this.parseToolCalls(fullResponse);
+                    const allToolCalls = [...toolCallsFromStream, ...parsedCalls];
+                    if (allToolCalls.length === 0) {
+                        consecutiveFailures++;
+                        if (consecutiveFailures >= 2) {
+                            assistantMsg.content = 'Failed to generate valid tool call after retries. Raw output:\n' + fullResponse;
+                            this.postUpdate();
+                            break;
+                        }
+                        // Let the model retry once
+                        this.messages.push({
+                            role: 'assistant',
+                            content: fullResponse
+                        });
+                        this.messages.push({
+                            role: 'tool',
+                            name: 'error',
+                            content: 'ERROR: Your tool call contained invalid JSON. Use simple, short code. Escape all quotes and newlines properly. Try again.'
+                        });
+                        this.postUpdate();
+                        continue;
+                    }
+                    consecutiveFailures = 0; // Reset on success
+                    for (const tc of allToolCalls) {
+                        const toolName = tc.function.name;
+                        let args = {};
+                        try {
+                            args = JSON.parse(this.sanitizeJson(tc.function.arguments));
+                        }
+                        catch (e) { /* skip */ }
+                        const res = await this.tools.executeTool(toolName, args, getBaseContext(requireConfirmation));
+                        this.messages.push({ role: 'tool', name: toolName, content: res });
+                    }
+                    this.postUpdate();
                 }
-                const stream = this.llmClient.streamChat(historyToKeep, undefined, (tc) => { toolCallsFromStream = tc; });
-                for await (const chunk of stream) {
-                    assistantMsg.content += chunk;
-                    this._view?.webview.postMessage({
-                        command: 'streamChunk',
-                        content: assistantMsg.content
-                    });
-                }
-                const parsedCalls = this.parseToolCalls(assistantMsg.content);
-                const allToolCalls = [...toolCallsFromStream, ...parsedCalls];
-                if (allToolCalls.length === 0) {
+                catch (error) {
+                    assistantMsg.content += `\n\n[Error]: ${error}`;
+                    this.postUpdate();
                     break;
                 }
-                for (const tc of allToolCalls) {
-                    const toolName = tc.function.name;
-                    let args = {};
-                    try {
-                        args = JSON.parse(this.sanitizeJson(tc.function.arguments));
-                    }
-                    catch (e) { /* skip */ }
-                    const res = await this.tools.executeTool(toolName, args, getBaseContext(requireConfirmation));
-                    this.messages.push({ role: 'tool', name: toolName, content: res });
-                }
-                this.postUpdate();
-            }
-            catch (error) {
-                assistantMsg.content += `\n\n[Error]: ${error}`;
-                this.postUpdate();
-                break;
             }
         }
-        this.isProcessing = false;
-        this.postUpdate();
+        finally {
+            this.isProcessing = false;
+            this.postUpdate();
+        }
     }
     parseToolCalls(response) {
         const calls = [];
-        const xmlRegex = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/gi;
-        let match;
-        while ((match = xmlRegex.exec(response)) !== null) {
-            let jsonStr = match[1].trim();
-            if (!jsonStr)
+        // Split on <tool_call> to handle multiple tool calls
+        // This works whether or not </tool_call> closing tags are present
+        const segments = response.split('<tool_call>');
+        for (const segment of segments) {
+            // Remove </tool_call> and trim
+            let jsonStr = segment.replace(/<\/tool_call>/g, '').trim();
+            if (!jsonStr || !jsonStr.includes('{') || !jsonStr.includes('}'))
                 continue;
             try {
-                if (jsonStr.includes('{') && jsonStr.includes('}')) {
-                    jsonStr = jsonStr.substring(jsonStr.indexOf('{'), jsonStr.lastIndexOf('}') + 1);
-                }
+                jsonStr = jsonStr.substring(jsonStr.indexOf('{'), jsonStr.lastIndexOf('}') + 1);
                 const parsed = JSON.parse(this.sanitizeJson(jsonStr));
                 if (parsed.name) {
                     calls.push({
@@ -212,18 +267,134 @@ class ChatViewProvider {
                     });
                 }
             }
-            catch { /* skip */ }
+            catch { /* skip malformed JSON */ }
         }
         return calls;
     }
     sanitizeJson(json) {
-        return json.replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'");
+        // Cut off at first complete JSON object (heuristic brace matching)
+        let braceDepth = 0;
+        let jsonEnd = -1;
+        for (let i = 0; i < json.length; i++) {
+            if (json[i] === '{')
+                braceDepth++;
+            else if (json[i] === '}') {
+                braceDepth--;
+                if (braceDepth === 0) {
+                    jsonEnd = i + 1;
+                    break;
+                }
+            }
+        }
+        if (jsonEnd > 0)
+            json = json.slice(0, jsonEnd);
+        let sanitized = json
+            .replace(/String\(\d+\)\.toString\(\)/g, '""')
+            .replace(/[\u201c\u201d]/g, '"')
+            .replace(/[\u2018\u2019]/g, "'")
+            .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u')
+            .replace(/([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
+            .replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2');
+        // Fix unescaped newlines/carriage returns within JSON strings
+        sanitized = sanitized.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_match, p1) => {
+            return `"${p1.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')}"`;
+        });
+        return sanitized;
     }
     postUpdate() {
         this._view?.webview.postMessage({ command: 'update', messages: this.messages, isProcessing: this.isProcessing });
     }
     getHtmlContent() {
-        return `<!DOCTYPE html><html><head><style>
+        // The webview JavaScript is built as a plain string to avoid
+        // template-literal escape-sequence processing, which silently
+        // corrupts regex patterns like \s \S \n inside backtick strings.
+        const S = '\\'; // single backslash helper
+        const BS = S + 's'; // produces the two-char string: \s
+        const BSS = S + 'S'; // produces: \S
+        const BN = S + 'n'; // produces: \n
+        const script = [
+            'var vscode = acquireVsCodeApi();',
+            'var msgDiv = document.getElementById("messages");',
+            'var input = document.getElementById("input");',
+            'var linkStatus = document.getElementById("link-status");',
+            'var sentCount = document.getElementById("sent-count");',
+            'var lastEvent = document.getElementById("last-event");',
+            'var count = 0;',
+            '',
+            'function logEvent(msg) {',
+            '  lastEvent.innerText = msg;',
+            '  console.log("[Falcon Debug]:", msg);',
+            '}',
+            '',
+            'function formatContent(content) {',
+            '  if (!content) return "";',
+            '  var re1 = new RegExp("<tool_call>[' + BS + BSS + ']*?</tool_call>", "gi");',
+            '  var re2 = new RegExp("<tool_call>[' + BS + BSS + ']*?$", "gi");',
+            '  var re3 = new RegExp("<tools>[' + BS + BSS + ']*?</tools>", "gi");',
+            '  var clean = content.replace(re1, "").replace(re2, "").replace(re3, "");',
+            '  var html = clean.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");',
+            '  var re4 = new RegExp("&lt;think&gt;([' + BS + BSS + ']*?)&lt;/think&gt;", "g");',
+            '  var re5 = new RegExp("&lt;think&gt;([' + BS + BSS + ']*?)$", "g");',
+            '  html = html.replace(re4, \'<div class="thinking"><div class="thinking-title">Thinking</div>$1</div>\');',
+            '  html = html.replace(re5, \'<div class="thinking"><div class="thinking-title">Thinking...</div>$1</div>\');',
+            '  html = html.replace(/' + BN + '/g, "<br>");',
+            '  return html.trim() || "...";',
+            '}',
+            '',
+            'function trySend() {',
+            '  var text = input.value.trim();',
+            '  console.log("[Falcon] trySend:", text);',
+            '  if (text) {',
+            '    count++;',
+            '    sentCount.innerText = count;',
+            '    logEvent("Sending...");',
+            '    vscode.postMessage({ command: "sendMessage", text: text });',
+            '    input.value = "";',
+            '    input.style.height = "auto";',
+            '  }',
+            '}',
+            '',
+            'document.getElementById("send-btn").addEventListener("click", function() {',
+            '  logEvent("Btn Click");',
+            '  trySend();',
+            '});',
+            '',
+            'input.addEventListener("keydown", function(e) {',
+            '  if (e.keyCode === 13 && !e.shiftKey) {',
+            '    e.preventDefault();',
+            '    logEvent("Enter Pressed");',
+            '    trySend();',
+            '  }',
+            '});',
+            '',
+            'window.addEventListener("message", function(e) {',
+            '  var data = e.data;',
+            '  if (data.command === "update") {',
+            '    linkStatus.innerText = "CONNECTED";',
+            '    linkStatus.className = "status-ok";',
+            '    logEvent("UI Update");',
+            '    msgDiv.innerHTML = data.messages.filter(function(m) { return m.role !== "system"; }).map(function(m) {',
+            '      var role = m.role.toUpperCase();',
+            '      return \'<div class="message \' + m.role + \'"><div class="message-role">\' + role + \'</div><div class="message-content">\' + formatContent(m.content) + \'</div></div>\';',
+            '    }).join("");',
+            '    msgDiv.scrollTop = msgDiv.scrollHeight;',
+            '  } else if (data.command === "streamChunk") {',
+            '    var containers = document.querySelectorAll(".message.assistant .message-content");',
+            '    if (containers.length > 0) {',
+            '      containers[containers.length - 1].innerHTML = formatContent(data.content);',
+            '      msgDiv.scrollTop = msgDiv.scrollHeight;',
+            '      logEvent("Streaming...");',
+            '    }',
+            '  } else if (data.command === "pong") {',
+            '    logEvent("PONG");',
+            '    alert("v0.1.7 Connection OK!");',
+            '  }',
+            '});',
+            '',
+            'logEvent("Ready v0.1.7");',
+            'vscode.postMessage({ command: "ping" });',
+        ].join('\n');
+        const css = `
             :root { --bg: var(--vscode-sideBar-background); --fg: var(--vscode-sideBar-foreground); --accent: var(--vscode-button-background); --border: var(--vscode-panel-border); }
             body { font-family: var(--vscode-font-family); background: var(--bg); color: var(--fg); height: 100vh; display: flex; flex-direction: column; overflow: hidden; margin: 0; font-size: 11px; }
             #toolbar { padding: 4px; border-bottom: 1px solid var(--border); display: flex; gap: 4px; background: var(--bg); }
@@ -244,101 +415,24 @@ class ChatViewProvider {
             .status-no { color: #f44; }
             pre { background: rgba(0,0,0,0.3); padding: 6px; border-radius: 4px; overflow-x: auto; margin: 4px 0; border: 1px solid rgba(255,255,255,0.1); }
             code { font-family: monospace; font-size: 10px; }
-        </style></head><body>
-        <div id="toolbar">
-            <button onclick="vscode.postMessage({command:'clearChat'})">New Chat</button>
-            <button onclick="vscode.postMessage({command:'stopGeneration'})">Stop</button>
-            <button onclick="vscode.postMessage({command:'ping'})">Ping</button>
-        </div>
-        <div id="messages"></div>
-        <div id="input-container">
-            <textarea id="input" rows="1" placeholder="Type here..."></textarea>
-            <button id="send-btn">SEND</button>
-        </div>
-        <div id="debug-panel">
-            <span>Link: <span id="link-status" class="status-no">WAITING</span></span>
-            <span>Sent: <span id="sent-count">0</span></span>
-            <span>Last: <span id="last-event">NONE</span></span>
-        </div>
-        <script>
-            const vscode = acquireVsCodeApi();
-            const messages = document.getElementById('messages');
-            const input = document.getElementById('input');
-            const linkStatus = document.getElementById('link-status');
-            const sentCount = document.getElementById('sent-count');
-            const lastEvent = document.getElementById('last-event');
-            let count = 0;
-
-            function logEvent(msg) {
-                lastEvent.innerText = msg;
-                console.log('[Falcon Debug]:', msg);
-            }
-
-            function formatContent(content) {
-                if (!content) return "";
-                let clean = content.replace(/<tool_call>[\\s\\S]*?<\/tool_call>/gi, '')
-                                   .replace(/<tool_call>[\\s\\S]*?$/gi, '')
-                                   .replace(/<tools>[\\s\\S]*?<\/tools>/gi, '');
-                let html = clean.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                html = html.replace(/&lt;think&gt;([\\s\\S]*?)&lt;\\/think&gt;/g, '<div class="thinking"><div class="thinking-title">Thinking</div>$1</div>');
-                html = html.replace(/&lt;think&gt;([\\s\\S]*?)$/g, '<div class="thinking"><div class="thinking-title">Thinking...</div>$1</div>');
-                html = html.replace(/\\n/g, '<br>');
-                return html.trim() || "...";
-            }
-
-            function trySend() {
-                const text = input.value.trim();
-                console.log('[Falcon] trySend:', text);
-                if (text) {
-                    count++;
-                    sentCount.innerText = count;
-                    logEvent('Sending...');
-                    vscode.postMessage({ command: 'sendMessage', text: text });
-                    input.value = '';
-                    input.style.height = 'auto';
-                }
-            }
-
-            document.getElementById('send-btn').addEventListener('click', () => {
-                logEvent('Btn Click');
-                trySend();
-            });
-
-            input.addEventListener('keydown', (e) => {
-                if (e.keyCode === 13 && !e.shiftKey) {
-                    e.preventDefault();
-                    logEvent('Enter Pressed');
-                    trySend();
-                }
-            });
-
-            window.addEventListener('message', e => {
-                const data = e.data;
-                if (data.command === 'update') {
-                    linkStatus.innerText = 'CONNECTED';
-                    linkStatus.className = 'status-ok';
-                    logEvent('UI Update');
-                    messages.innerHTML = data.messages.filter(m => m.role !== 'system').map(m => {
-                        const role = m.role.toUpperCase();
-                        return \`<div class="message \${m.role}"><div class="message-role">\${role}</div><div class="message-content">\${formatContent(m.content)}</div></div>\`;
-                    }).join('');
-                    messages.scrollTop = messages.scrollHeight;
-                } else if (data.command === 'streamChunk') {
-                    const containers = document.querySelectorAll('.message.assistant .message-content');
-                    if (containers.length > 0) {
-                        containers[containers.length - 1].innerHTML = formatContent(data.content);
-                        messages.scrollTop = messages.scrollHeight;
-                        logEvent('Streaming...');
-                    }
-                } else if (data.command === 'pong') {
-                    logEvent('PONG');
-                    alert('v0.1.6 Connection OK!');
-                }
-            });
-
-            logEvent('Ready v0.1.6');
-            vscode.postMessage({ command: 'ping' });
-        </script></body></html>`;
+        `;
+        return '<!DOCTYPE html><html><head><style>' + css + '</style></head><body>'
+            + '<div id="toolbar">'
+            + '<button onclick="vscode.postMessage({command:\'clearChat\'})">New Chat</button>'
+            + '<button onclick="vscode.postMessage({command:\'stopGeneration\'})">Stop</button>'
+            + '<button onclick="vscode.postMessage({command:\'ping\'})">Ping</button>'
+            + '</div>'
+            + '<div id="messages"></div>'
+            + '<div id="input-container">'
+            + '<textarea id="input" rows="1" placeholder="Type here..."></textarea>'
+            + '<button id="send-btn">SEND</button>'
+            + '</div>'
+            + '<div id="debug-panel">'
+            + '<span>Link: <span id="link-status" class="status-no">WAITING</span></span>'
+            + '<span>Sent: <span id="sent-count">0</span></span>'
+            + '<span>Last: <span id="last-event">NONE</span></span>'
+            + '</div>'
+            + '<script>' + script + '</script></body></html>';
     }
 }
 exports.ChatViewProvider = ChatViewProvider;

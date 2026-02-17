@@ -80,7 +80,7 @@ export declare class LlamaCppClient {
     /**
      * Stream chat completions from the LLM
      */
-    streamChat(messages: ChatMessage[], tools?: Tool[], onToolCall?: (toolCalls: ToolCall[]) => void): AsyncGenerator<string, void, unknown>;
+    streamChat(messages: ChatMessage[], tools?: Tool[], onToolCall?: (toolCalls: ToolCall[]) => void, stop?: string[]): AsyncGenerator<string, void, unknown>;
     /**
      * Non-streaming chat completion
      */

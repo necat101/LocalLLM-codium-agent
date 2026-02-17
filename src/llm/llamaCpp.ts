@@ -125,7 +125,8 @@ export class LlamaCppClient {
     async *streamChat(
         messages: ChatMessage[],
         tools?: Tool[],
-        onToolCall?: (toolCalls: ToolCall[]) => void
+        onToolCall?: (toolCalls: ToolCall[]) => void,
+        stop?: string[]
     ): AsyncGenerator<string, void, unknown> {
         this.abortController = new AbortController();
 
@@ -142,7 +143,8 @@ export class LlamaCppClient {
             top_p: this.config.topP,
             top_k: this.config.topK,
             frequency_penalty: this.config.frequencyPenalty,
-            stream: true
+            stream: true,
+            ...(stop && stop.length > 0 && { stop })
         };
 
         // Add tools if provided (for function calling)

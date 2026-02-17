@@ -58,7 +58,7 @@ class LlamaCppClient {
     /**
      * Stream chat completions from the LLM
      */
-    async *streamChat(messages, tools, onToolCall) {
+    async *streamChat(messages, tools, onToolCall, stop) {
         this.abortController = new AbortController();
         const requestBody = {
             messages: messages.map(m => ({
@@ -73,7 +73,8 @@ class LlamaCppClient {
             top_p: this.config.topP,
             top_k: this.config.topK,
             frequency_penalty: this.config.frequencyPenalty,
-            stream: true
+            stream: true,
+            ...(stop && stop.length > 0 && { stop })
         };
         // Add tools if provided (for function calling)
         if (tools && tools.length > 0) {

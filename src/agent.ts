@@ -7,21 +7,44 @@ import * as vscode from 'vscode';
 import { LlamaCppClient, ChatMessage, ToolCall, Tool } from './llm/llamaCpp';
 import { ToolRegistry, ToolContext } from './tools/registry';
 
-const SYSTEM_PROMPT = `You are Falcon, a helpful AI assistant created by Technology Innovation Institute (TII). To answer the user's question, you first think about the reasoning process and then provide the user with the answer. The reasoning process is enclosed within <think> </think> tags, i.e., <think> reasoning process here </think> answer here.
+const SYSTEM_PROMPT = `You are Falcon, an expert AI coding assistant. You solve tasks by using tools.
 
-# Tools
-You may call one or more functions to assist with the user query. You are provided with function signatures within <tools></tools> XML tags.
+## Critical Rules
+- When asked to write code, IMMEDIATELY call write_file. Do NOT write code in your response.
+- When asked about existing code, call read_file first.
+- To compile or run code, call run_command.
+- NEVER explain how you would implement something. Just DO it with tools.
+- After receiving tool results, either call another tool or give a SHORT final answer.
+
+## Available Tools
 <tools>
 {TOOL_DEFINITIONS}
 </tools>
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+
+## Tool Call Format
+You MUST use this EXACT format. Every <tool_call> MUST have a matching </tool_call>.
 <tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
+{"name": "tool_name", "arguments": {"param": "value"}}
+</tool_call>
+
+IMPORTANT: Always close each tool call with </tool_call> BEFORE starting the next one.
+
+## Example: Single tool
+<tool_call>
+{"name": "write_file", "arguments": {"path": "hello.py", "content": "print('Hello!')"}}
+</tool_call>
+
+## Example: Multiple tools
+<tool_call>
+{"name": "write_file", "arguments": {"path": "main.rs", "content": "fn main() { println!(\\"Hello\\"); }"}}
+</tool_call>
+<tool_call>
+{"name": "run_command", "arguments": {"command": "rustc main.rs && ./main"}}
 </tool_call>
 
 Working directory: {WORKSPACE}
 
-Respond ONLY with a tool_call. No explanations.`;
+Respond ONLY with tool_call blocks. No explanations.`;
 
 export class AgentChat {
     private conversationHistory: ChatMessage[] = [];
@@ -73,7 +96,10 @@ export class AgentChat {
         // Reset session state
         this.hasWrittenFile = false;
 
-        const systemPrompt = SYSTEM_PROMPT.replace('{WORKSPACE}', workspaceRoot);
+        const toolDefs = this.tools.getToolDefinitions().map(d => JSON.stringify(d)).join('\n');
+        const systemPrompt = SYSTEM_PROMPT
+            .replace('{WORKSPACE}', workspaceRoot)
+            .replace('{TOOL_DEFINITIONS}', toolDefs);
 
         // Build conversation messages
         const messages: ChatMessage[] = [
@@ -92,20 +118,29 @@ export class AgentChat {
                 // Progress indicator
                 stream.progress(`Thinking... (iteration ${iteration}/${maxIterations})`);
 
-                // Get LLM response
+                // Get LLM response — force tool call via prefix injection
                 let fullResponse = '';
-                const pendingToolCalls: ToolCall[] = [];
+                let pendingToolCalls: ToolCall[] = [];
 
-                // Stream the response - suppress all text output
+                // Pre-fill assistant with tool call start to prevent rambling
+                const toolCallPrefix = '<tool_call>\n{"name": "';
+                const prefixedMessages = [
+                    ...messages,
+                    { role: 'assistant' as const, content: toolCallPrefix }
+                ];
+
+                let toolCallText = '';
                 for await (const chunk of this.llm.streamChat(
-                    messages,
+                    prefixedMessages,
                     undefined,
-                    (toolCalls) => pendingToolCalls.push(...toolCalls)
+                    (toolCalls) => pendingToolCalls.push(...toolCalls),
+                    ['</tool_call>']  // Only stop at closing tag
                 )) {
-                    fullResponse += chunk;
+                    toolCallText += chunk;
                 }
 
-                // Parse tool calls from the response text
+                // Reconstruct: prefix + generated text
+                fullResponse = toolCallPrefix + toolCallText;
                 const parsedToolCalls = this.parseToolCalls(fullResponse);
                 const allToolCalls = [...pendingToolCalls, ...parsedToolCalls];
 
@@ -363,13 +398,15 @@ export class AgentChat {
             } catch { /* skip */ }
         }
 
-        // Pattern 2: <tool_call>...</tool_call> XML tags
+        // Pattern 2: <tool_call>...</tool_call> or <tool_call>...}} (unclosed)
         if (calls.length === 0) {
-            const xmlToolCallRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
-            while ((match = xmlToolCallRegex.exec(response)) !== null) {
+            const segments = response.split('<tool_call>');
+            for (const segment of segments) {
+                let jsonStr = segment.replace(/<\/tool_call>/g, '').trim();
+                if (!jsonStr || !jsonStr.includes('{') || !jsonStr.includes('}')) continue;
                 try {
-                    const jsonContent = this.sanitizeJson(match[1]);
-                    const parsed = JSON.parse(jsonContent);
+                    jsonStr = jsonStr.substring(jsonStr.indexOf('{'), jsonStr.lastIndexOf('}') + 1);
+                    const parsed = JSON.parse(this.sanitizeJson(jsonStr));
                     if (parsed.name) {
                         calls.push({
                             id: `call_${Date.now()}_${calls.length}`,
@@ -425,6 +462,7 @@ export class AgentChat {
         if (jsonEnd > 0) json = json.slice(0, jsonEnd);
 
         let sanitized = json
+            .replace(/String\(\d+\)\.toString\(\)/g, '""')
             .replace(/'([^'\\]*)'/g, '"$1"')
             .replace(/[\u201c\u201d]/g, '"')
             .replace(/[\u2018\u2019]/g, "'")
