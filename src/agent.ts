@@ -9,6 +9,10 @@ import { ToolRegistry, ToolContext } from './tools/registry';
 
 const SYSTEM_PROMPT = `You are Falcon, an expert AI coding assistant. You solve tasks by using tools.
 
+## Operating Environment
+OS: ${process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux'}
+Shell: ${process.platform === 'win32' ? 'powershell/cmd' : 'bash'}
+
 ## Critical Rules
 - When asked to write code, IMMEDIATELY call write_file. Do NOT write code in your response.
 - When asked about existing code, call read_file first.
@@ -207,7 +211,7 @@ export class AgentChat {
                         continue;
                     }
 
-                    let toolArgs: Record<string, unknown>;
+                    let toolArgs: Record<string, unknown> = {};
                     try {
                         let argsString = toolCall.function.arguments
                             .replace(/[\u201c\u201d]/g, '"')
@@ -215,7 +219,15 @@ export class AgentChat {
                             .replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, '');
                         toolArgs = JSON.parse(argsString);
                     } catch {
-                        toolArgs = {};
+                        // Fallback: try to rescue the arguments using the regex extractor
+                        const syntheizedJson = `{"name": "${toolName}", "arguments": ${toolCall.function.arguments}}`;
+                        const dummyCalls: ToolCall[] = [];
+                        this.rescueToolCall(syntheizedJson, dummyCalls);
+                        if (dummyCalls.length > 0) {
+                            try {
+                                toolArgs = JSON.parse(dummyCalls[0].function.arguments as string);
+                            } catch { /* skip */ }
+                        }
                     }
 
                     // ENFORCE: write_file must come before run_command (except for enumeration)
@@ -379,19 +391,25 @@ export class AgentChat {
     private parseToolCalls(response: string): ToolCall[] {
         const calls: ToolCall[] = [];
 
+        // Strip out <think> blocks (could contain hypothetical tool calls that shouldn't execute)
+        response = response.replace(/<think>[\s\S]*?(<\/think>|$)/gi, '');
+
         // Pattern 1: ```tool_call\n{...}\n```
         const toolCallBlockRegex = /```(?:tool_call|json)?\s*\n?\s*(\{[\s\S]*?"name"[\s\S]*?\})\s*\n?```/gi;
         let match;
         while ((match = toolCallBlockRegex.exec(response)) !== null) {
             try {
                 const parsed = JSON.parse(match[1]);
-                if (parsed.name) {
+                const { name, arguments: args, parameters: params, ...rest } = parsed;
+                if (name) {
+                    let finalArgs = args || params;
+                    if (!finalArgs && Object.keys(rest).length > 0) finalArgs = rest;
                     calls.push({
                         id: `call_${Date.now()}_${calls.length}`,
                         type: 'function',
                         function: {
-                            name: parsed.name,
-                            arguments: JSON.stringify(parsed.arguments || parsed.params || {})
+                            name: name,
+                            arguments: typeof finalArgs === 'string' ? finalArgs : JSON.stringify(finalArgs || {})
                         }
                     });
                 }
@@ -407,17 +425,22 @@ export class AgentChat {
                 try {
                     jsonStr = jsonStr.substring(jsonStr.indexOf('{'), jsonStr.lastIndexOf('}') + 1);
                     const parsed = JSON.parse(this.sanitizeJson(jsonStr));
-                    if (parsed.name) {
+                    const { name, arguments: args, parameters: params, ...rest } = parsed;
+                    if (name) {
+                        let finalArgs = args || params;
+                        if (!finalArgs && Object.keys(rest).length > 0) finalArgs = rest;
                         calls.push({
                             id: `call_${Date.now()}_${calls.length}`,
                             type: 'function',
                             function: {
-                                name: parsed.name,
-                                arguments: JSON.stringify(parsed.arguments || parsed.params || {})
+                                name: name,
+                                arguments: typeof finalArgs === 'string' ? finalArgs : JSON.stringify(finalArgs || {})
                             }
                         });
                     }
-                } catch { /* skip */ }
+                } catch {
+                    this.rescueToolCall(jsonStr, calls);
+                }
             }
         }
 
@@ -428,13 +451,16 @@ export class AgentChat {
                 try {
                     const sanitized = this.sanitizeJson(jsonStr);
                     const parsed = JSON.parse(sanitized);
-                    if (parsed.name && typeof parsed.name === 'string') {
+                    const { name, arguments: args, parameters: params, ...rest } = parsed;
+                    if (name && typeof name === 'string') {
+                        let finalArgs = args || params;
+                        if (!finalArgs && Object.keys(rest).length > 0) finalArgs = rest;
                         calls.push({
                             id: `call_${Date.now()}_${calls.length}`,
                             type: 'function',
                             function: {
-                                name: parsed.name,
-                                arguments: JSON.stringify(parsed.arguments || parsed.params || {})
+                                name: name,
+                                arguments: typeof finalArgs === 'string' ? finalArgs : JSON.stringify(finalArgs || {})
                             }
                         });
                     }
@@ -446,36 +472,152 @@ export class AgentChat {
     }
 
     /**
+     * Rescue a tool call from broken JSON using regex extraction.
+     * Handles cases where JSON.parse fails but the tool name, path, etc are identifiable.
+     */
+    private rescueToolCall(jsonStr: string, calls: ToolCall[]): void {
+        const nameMatch = jsonStr.match(/"name"\s*[:=]\s*"(\w+)"/);
+        if (!nameMatch) return;
+        const toolName = nameMatch[1];
+
+        if (toolName === 'write_file' || toolName === 'append_file') {
+            let path = 'untitled';
+            const pathMatch = jsonStr.match(/"path"\s*[:=]\s*"([^"]+)"/);
+            if (pathMatch) {
+                path = pathMatch[1];
+            }
+
+            // Extract content: try standard keys first
+            let contentKeyIdx = jsonStr.indexOf('"content"');
+            if (contentKeyIdx < 0) contentKeyIdx = jsonStr.indexOf('"text"');
+            if (contentKeyIdx < 0) contentKeyIdx = jsonStr.indexOf('"code"');
+
+            let content = '';
+            if (contentKeyIdx >= 0) {
+                const afterKey = jsonStr.substring(contentKeyIdx);
+                const contentStart = afterKey.match(/"(?:content|text|code)"\s*[:=]\s*(?:r#)?"/);
+                if (contentStart) {
+                    content = afterKey.substring(contentStart[0].length);
+                }
+            }
+
+            if (!content) {
+                // Aggressive rescue: find what looks like a raw string right after the path
+                const pathMatchStr = jsonStr.match(/"path"\s*[:=]\s*"[^"]+"\s*(?:}|\])?\s*,\s*(?:r#)?"/);
+                if (pathMatchStr) {
+                    const startIdx = pathMatchStr.index! + pathMatchStr[0].length;
+                    content = jsonStr.substring(startIdx);
+                } else {
+                    return;
+                }
+            }
+
+            // Strip trailing JSON structure: "}} or similar
+            content = content.replace(/["\s}]*$/, '');
+            // Remove trailing incomplete escape: backslash at end
+            content = content.replace(/\\$/, '');
+            // Unescape JSON string escapes manually
+            content = content
+                .replace(/\\n/g, '\n')
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .replace(/\\t/g, '\t')
+                .replace(/\\r/g, '\r');
+
+            calls.push({
+                id: `call_${Date.now()}_${calls.length}`,
+                type: 'function',
+                function: {
+                    name: toolName,
+                    arguments: JSON.stringify({ path, content })
+                }
+            });
+        } else {
+            // For other tools: try to extract arguments object, allowing for } inside strings
+            const argsMatch = jsonStr.match(/"?arguments"?\s*[:=]\s*(\{.*)/s);
+            if (argsMatch) {
+                try {
+                    let extracted = argsMatch[1];
+                    extracted = extracted.replace(/}<\/tool_call>\s*$/, '}');
+                    extracted = extracted.replace(/}\s*}$/, '}');
+                    const args = JSON.parse(this.sanitizeJson(extracted));
+                    calls.push({
+                        id: `call_${Date.now()}_${calls.length}`,
+                        type: 'function',
+                        function: { name: toolName, arguments: JSON.stringify(args) }
+                    });
+                } catch { /* can't rescue */ }
+            }
+        }
+    }
+
+    /**
      * Sanitize malformed JSON from model output
      */
     private sanitizeJson(json: string): string {
-        // Cut off at first complete JSON object
         let braceDepth = 0;
-        let jsonEnd = -1;
+        let inString = false;
+        let escapeNext = false;
+        let objectStarted = false;
+        let sanitizedChars: string[] = [];
+
         for (let i = 0; i < json.length; i++) {
-            if (json[i] === '{') braceDepth++;
-            else if (json[i] === '}') {
-                braceDepth--;
-                if (braceDepth === 0) { jsonEnd = i + 1; break; }
+            const char = json[i];
+
+            if (escapeNext) {
+                sanitizedChars.push(char);
+                escapeNext = false;
+                continue;
+            }
+
+            if (char === '\\') {
+                sanitizedChars.push(char);
+                escapeNext = true;
+                continue;
+            }
+
+            if (char === '"') {
+                inString = !inString;
+            } else if (!inString) {
+                if (char === '{') {
+                    braceDepth++;
+                    objectStarted = true;
+                } else if (char === '}') {
+                    braceDepth--;
+                }
+            } else {
+                // We are inside a string. If we see a literal newline, escape it.
+                if (char === '\n') {
+                    sanitizedChars.push('\\', 'n');
+                    continue;
+                } else if (char === '\r') {
+                    sanitizedChars.push('\\', 'r');
+                    continue;
+                } else if (char === '\t') {
+                    sanitizedChars.push('\\', 't');
+                    continue;
+                }
+            }
+
+            sanitizedChars.push(char);
+
+            if (objectStarted && braceDepth === 0) {
+                break;
             }
         }
-        if (jsonEnd > 0) json = json.slice(0, jsonEnd);
 
-        let sanitized = json
+        let cutJson = sanitizedChars.join('');
+        if (braceDepth > 0) {
+            cutJson += '}'.repeat(braceDepth);
+        }
+
+        let sanitized = cutJson
+            .replace(/r#"/g, '"')
+            .replace(/"#/g, '"')
             .replace(/String\(\d+\)\.toString\(\)/g, '""')
-            .replace(/'([^'\\]*)'/g, '"$1"')
             .replace(/[\u201c\u201d]/g, '"')
             .replace(/[\u2018\u2019]/g, "'")
-            .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u')
-            .replace(/,\s*(arguments|params)\s*:/gi, ',"$1":')
-            .replace(/,\s*(arguments|params)\s*\{/gi, ',"$1":{')
-            .replace(/([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
-            .replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2');
-
-        // Fix unescaped newlines within JSON strings
-        sanitized = sanitized.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_match: string, p1: string) => {
-            return `"${p1.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
-        });
+            .replace(/(?<!\\)\\u(?![0-9a-fA-F]{4})/g, '\\\\u');
 
         return sanitized;
     }

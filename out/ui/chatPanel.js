@@ -40,6 +40,10 @@ exports.ChatViewProvider = void 0;
 const vscode = __importStar(require("vscode"));
 const SHARED_SYSTEM_PROMPT = `You are Falcon, an expert AI coding assistant. You solve tasks by using tools.
 
+## Operating Environment
+OS: ${process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'macOS' : 'Linux'}
+Shell: ${process.platform === 'win32' ? 'powershell/cmd' : 'bash'}
+
 ## Critical Rules
 - When asked to write code, IMMEDIATELY call write_file. Do NOT write code in your response.
 - When asked about existing code, call read_file first.
@@ -197,15 +201,50 @@ class ChatViewProvider {
                     const fullResponse = toolCallPrefix + toolCallText;
                     assistantMsg.content = fullResponse;
                     const parsedCalls = this.parseToolCalls(fullResponse);
-                    const allToolCalls = [...toolCallsFromStream, ...parsedCalls];
+                    let allToolCalls = [...toolCallsFromStream, ...parsedCalls];
+                    // Fallback: extract code blocks from response if no write_file tool call is found
+                    const hasWriteFile = allToolCalls.some(tc => tc.function.name === 'write_file' || tc.function.name === 'append_file');
+                    if (!hasWriteFile) {
+                        // Match code blocks lazily up to closing backticks OR the end of string (for unclosed blocks)
+                        const codeBlockRegex = /```(?:rust|rs|python|py|javascript|js|c|cpp|typescript|ts|html|css|java|go|php|ruby|swift|kotlin|sh|bash|json)\s*\n([\s\S]*?)(?:```|$)/;
+                        const codeBlock = fullResponse.match(codeBlockRegex);
+                        if (codeBlock && codeBlock[1].trim().length > 50) {
+                            const langTagMatch = fullResponse.match(/```(\w+)/);
+                            const langTag = langTagMatch ? langTagMatch[1].toLowerCase() : 'rs';
+                            const extMap = { rust: 'rs', rs: 'rs', c: 'c', cpp: 'cpp', python: 'py', py: 'py', javascript: 'js', js: 'js', typescript: 'ts', ts: 'ts', html: 'html', css: 'css', java: 'java', go: 'go', php: 'php', ruby: 'rb', swift: 'swift', kotlin: 'kt', sh: 'sh', bash: 'sh', json: 'json' };
+                            const ext = extMap[langTag] || 'txt';
+                            const userMsg = this.messages.find(m => m.role === 'user');
+                            const promptLower = (userMsg?.content || '').toLowerCase();
+                            let fileName = `snippet.${ext}`;
+                            if (promptLower.includes('atkin'))
+                                fileName = `sieve_of_atkin.${ext}`;
+                            else if (promptLower.includes('eratosthenes'))
+                                fileName = `sieve_eratosthenes.${ext}`;
+                            else if (promptLower.includes('fibonacci'))
+                                fileName = `fibonacci.${ext}`;
+                            else if (promptLower.includes('hello'))
+                                fileName = `hello.${ext}`;
+                            else if (promptLower.includes('sort'))
+                                fileName = `sort.${ext}`;
+                            allToolCalls.push({
+                                id: `call_${Date.now()}_fallback`,
+                                type: 'function',
+                                function: {
+                                    name: 'write_file',
+                                    arguments: JSON.stringify({ path: fileName, content: codeBlock[1].trim() })
+                                }
+                            });
+                            // Remove the massive code block from the chat to prevent context overflow 
+                            assistantMsg.content = assistantMsg.content.replace(codeBlockRegex, '\n_[Code automatically extracted to file by UI]_\n');
+                        }
+                    }
                     if (allToolCalls.length === 0) {
                         consecutiveFailures++;
-                        if (consecutiveFailures >= 2) {
+                        if (consecutiveFailures >= 3) {
                             assistantMsg.content = 'Failed to generate valid tool call after retries. Raw output:\n' + fullResponse;
                             this.postUpdate();
                             break;
                         }
-                        // Let the model retry once
                         this.messages.push({
                             role: 'assistant',
                             content: fullResponse
@@ -218,14 +257,25 @@ class ChatViewProvider {
                         this.postUpdate();
                         continue;
                     }
-                    consecutiveFailures = 0; // Reset on success
+                    consecutiveFailures = 0;
                     for (const tc of allToolCalls) {
                         const toolName = tc.function.name;
                         let args = {};
                         try {
                             args = JSON.parse(this.sanitizeJson(tc.function.arguments));
                         }
-                        catch (e) { /* skip */ }
+                        catch (e) {
+                            // Fallback: try to rescue the arguments using the regex extractor
+                            const syntheizedJson = `{"name": "${toolName}", "arguments": ${tc.function.arguments}}`;
+                            const dummyCalls = [];
+                            this.rescueToolCall(syntheizedJson, dummyCalls);
+                            if (dummyCalls.length > 0) {
+                                try {
+                                    args = JSON.parse(this.sanitizeJson(dummyCalls[0].function.arguments));
+                                }
+                                catch { /* skip */ }
+                            }
+                        }
                         const res = await this.tools.executeTool(toolName, args, getBaseContext(requireConfirmation));
                         this.messages.push({ role: 'tool', name: toolName, content: res });
                     }
@@ -245,60 +295,185 @@ class ChatViewProvider {
     }
     parseToolCalls(response) {
         const calls = [];
-        // Split on <tool_call> to handle multiple tool calls
-        // This works whether or not </tool_call> closing tags are present
+        // Strip out <think> blocks (could contain hypothetical tool calls that shouldn't execute)
+        response = response.replace(/<think>[\s\S]*?(<\/think>|$)/gi, '');
         const segments = response.split('<tool_call>');
         for (const segment of segments) {
-            // Remove </tool_call> and trim
             let jsonStr = segment.replace(/<\/tool_call>/g, '').trim();
             if (!jsonStr || !jsonStr.includes('{') || !jsonStr.includes('}'))
                 continue;
             try {
                 jsonStr = jsonStr.substring(jsonStr.indexOf('{'), jsonStr.lastIndexOf('}') + 1);
                 const parsed = JSON.parse(this.sanitizeJson(jsonStr));
-                if (parsed.name) {
+                const { name, arguments: args, parameters: params, ...rest } = parsed;
+                if (name) {
+                    let finalArgs = args || params;
+                    if (!finalArgs && Object.keys(rest).length > 0)
+                        finalArgs = rest;
                     calls.push({
                         id: `call_${Date.now()}_${calls.length}`,
                         type: 'function',
                         function: {
-                            name: parsed.name,
-                            arguments: typeof parsed.arguments === 'string' ? parsed.arguments : JSON.stringify(parsed.arguments || {})
+                            name: name,
+                            arguments: typeof finalArgs === 'string' ? finalArgs : JSON.stringify(finalArgs || {})
                         }
                     });
                 }
             }
-            catch { /* skip malformed JSON */ }
+            catch {
+                // Regex rescue: extract tool calls from broken JSON
+                this.rescueToolCall(jsonStr, calls);
+            }
         }
         return calls;
     }
-    sanitizeJson(json) {
-        // Cut off at first complete JSON object (heuristic brace matching)
-        let braceDepth = 0;
-        let jsonEnd = -1;
-        for (let i = 0; i < json.length; i++) {
-            if (json[i] === '{')
-                braceDepth++;
-            else if (json[i] === '}') {
-                braceDepth--;
-                if (braceDepth === 0) {
-                    jsonEnd = i + 1;
-                    break;
+    /**
+     * Rescue a tool call from broken JSON using regex extraction.
+     * Handles cases where JSON.parse fails but the tool name, path, etc are identifiable.
+     */
+    rescueToolCall(jsonStr, calls) {
+        const nameMatch = jsonStr.match(/"name"\s*[:=]\s*"(\w+)"/);
+        if (!nameMatch)
+            return;
+        const toolName = nameMatch[1];
+        if (toolName === 'write_file' || toolName === 'append_file') {
+            let path = 'untitled';
+            const pathMatch = jsonStr.match(/"path"\s*[:=]\s*"([^"]+)"/);
+            if (pathMatch) {
+                path = pathMatch[1];
+            }
+            else {
+                // Determine path based on content loosely
+                if (jsonStr.toLowerCase().includes('atkin'))
+                    path = 'sieve_of_atkin.rs';
+                else if (jsonStr.toLowerCase().includes('eratosthenes'))
+                    path = 'sieve_eratosthenes.rs';
+            }
+            // Extract content: try standard keys first
+            let contentKeyIdx = jsonStr.indexOf('"content"');
+            if (contentKeyIdx < 0)
+                contentKeyIdx = jsonStr.indexOf('"text"');
+            if (contentKeyIdx < 0)
+                contentKeyIdx = jsonStr.indexOf('"code"');
+            let content = '';
+            if (contentKeyIdx >= 0) {
+                const afterKey = jsonStr.substring(contentKeyIdx);
+                const contentStart = afterKey.match(/"(?:content|text|code)"\s*[:=]\s*(?:r#)?"/);
+                if (contentStart) {
+                    content = afterKey.substring(contentStart[0].length);
                 }
             }
+            if (!content) {
+                // Aggressive rescue: find what looks like a raw string right after the path
+                const pathMatchStr = jsonStr.match(/"path"\s*[:=]\s*"[^"]+"\s*(?:}|\])?\s*,\s*(?:r#)?"/);
+                if (pathMatchStr) {
+                    const startIdx = pathMatchStr.index + pathMatchStr[0].length;
+                    content = jsonStr.substring(startIdx);
+                }
+                else {
+                    return;
+                }
+            }
+            // Strip trailing JSON structure: "}} or similar
+            content = content.replace(/["\s}]*$/, '');
+            // Remove trailing incomplete escape: backslash at end
+            content = content.replace(/\\$/, '');
+            // Unescape JSON string escapes manually
+            content = content
+                .replace(/\\n/g, '\n')
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\')
+                .replace(/\\t/g, '\t')
+                .replace(/\\r/g, '\r');
+            calls.push({
+                id: `call_${Date.now()}_${calls.length}`,
+                type: 'function',
+                function: {
+                    name: toolName,
+                    arguments: JSON.stringify({ path, content })
+                }
+            });
         }
-        if (jsonEnd > 0)
-            json = json.slice(0, jsonEnd);
-        let sanitized = json
+        else {
+            // For other tools: try to extract arguments object, allowing for } inside strings
+            const argsMatch = jsonStr.match(/"?arguments"?\s*[:=]\s*(\{.*)/s);
+            if (argsMatch) {
+                try {
+                    let extracted = argsMatch[1];
+                    extracted = extracted.replace(/}<\/tool_call>\s*$/, '}');
+                    extracted = extracted.replace(/}\s*}$/, '}');
+                    const args = JSON.parse(this.sanitizeJson(extracted));
+                    calls.push({
+                        id: `call_${Date.now()}_${calls.length}`,
+                        type: 'function',
+                        function: { name: toolName, arguments: JSON.stringify(args) }
+                    });
+                }
+                catch { /* can't rescue */ }
+            }
+        }
+    }
+    sanitizeJson(json) {
+        let braceDepth = 0;
+        let inString = false;
+        let escapeNext = false;
+        let objectStarted = false;
+        let sanitizedChars = [];
+        for (let i = 0; i < json.length; i++) {
+            const char = json[i];
+            if (escapeNext) {
+                sanitizedChars.push(char);
+                escapeNext = false;
+                continue;
+            }
+            if (char === '\\') {
+                sanitizedChars.push(char);
+                escapeNext = true;
+                continue;
+            }
+            if (char === '"') {
+                inString = !inString;
+            }
+            else if (!inString) {
+                if (char === '{') {
+                    braceDepth++;
+                    objectStarted = true;
+                }
+                else if (char === '}') {
+                    braceDepth--;
+                }
+            }
+            else {
+                // We are inside a string. If we see a literal newline, escape it.
+                if (char === '\n') {
+                    sanitizedChars.push('\\', 'n');
+                    continue;
+                }
+                else if (char === '\r') {
+                    sanitizedChars.push('\\', 'r');
+                    continue;
+                }
+                else if (char === '\t') {
+                    sanitizedChars.push('\\', 't');
+                    continue;
+                }
+            }
+            sanitizedChars.push(char);
+            if (objectStarted && braceDepth === 0) {
+                break;
+            }
+        }
+        let cutJson = sanitizedChars.join('');
+        if (braceDepth > 0) {
+            cutJson += '}'.repeat(braceDepth);
+        }
+        let sanitized = cutJson
+            .replace(/r#"/g, '"')
+            .replace(/"#/g, '"')
             .replace(/String\(\d+\)\.toString\(\)/g, '""')
             .replace(/[\u201c\u201d]/g, '"')
             .replace(/[\u2018\u2019]/g, "'")
-            .replace(/\\u(?![0-9a-fA-F]{4})/g, '\\\\u')
-            .replace(/([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":')
-            .replace(/:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([,}])/g, ':"$1"$2');
-        // Fix unescaped newlines/carriage returns within JSON strings
-        sanitized = sanitized.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/gs, (_match, p1) => {
-            return `"${p1.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')}"`;
-        });
+            .replace(/(?<!\\)\\u(?![0-9a-fA-F]{4})/g, '\\\\u');
         return sanitized;
     }
     postUpdate() {

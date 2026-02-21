@@ -23,6 +23,11 @@ export declare class AgentChat {
      */
     private parseToolCalls;
     /**
+     * Rescue a tool call from broken JSON using regex extraction.
+     * Handles cases where JSON.parse fails but the tool name, path, etc are identifiable.
+     */
+    private rescueToolCall;
+    /**
      * Sanitize malformed JSON from model output
      */
     private sanitizeJson;

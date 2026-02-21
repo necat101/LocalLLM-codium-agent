@@ -21,6 +21,11 @@ export declare class ChatViewProvider implements vscode.WebviewViewProvider {
     private handleUserMessage;
     private runAgentLoop;
     private parseToolCalls;
+    /**
+     * Rescue a tool call from broken JSON using regex extraction.
+     * Handles cases where JSON.parse fails but the tool name, path, etc are identifiable.
+     */
+    private rescueToolCall;
     private sanitizeJson;
     private postUpdate;
     private getHtmlContent;

@@ -355,8 +355,12 @@ function getFileTools() {
                     if (content.trim().length === 0) {
                         return `❌ Error: The file is empty. There is no content to search or replace. STOP using edit_file. \nUse write_file or append_file to add the initial content.`;
                     }
+                    if (search === undefined || search === null)
+                        return `❌ Error: Missing 'search' parameter. You must include "search": "..." in your JSON to specify the exact text to replace.`;
                     if (!search)
-                        return `❌ Error: Search text cannot be empty.`;
+                        return `❌ Error: Search text cannot be empty. You must specify the exact text to replace.`;
+                    if (replace === undefined || replace === null)
+                        return `❌ Error: Missing 'replace' parameter. You must include "replace": "..." in your JSON. Use an empty string if you want to delete the search text.`;
                     const normalizedContent = content.replace(/\r\n/g, '\n');
                     const normalizedSearch = search.replace(/\r\n/g, '\n');
                     let normalizedReplace = replace.replace(/\r\n/g, '\n');
@@ -369,17 +373,29 @@ function getFileTools() {
                         targetEnd = strictIndex + normalizedSearch.length;
                     }
                     else {
-                        // Try fuzzy whitespace matching
-                        const escapedSearch = normalizedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                        const fuzzyPattern = escapedSearch.replace(/\s+/g, '\\s+');
-                        const fuzzyRegex = new RegExp(fuzzyPattern, 'g');
-                        const matches = Array.from(normalizedContent.matchAll(fuzzyRegex));
-                        if (matches.length === 1) {
-                            targetStart = matches[0].index;
-                            targetEnd = targetStart + matches[0][0].length;
-                        }
-                        else if (matches.length > 1) {
-                            return `❌ Error: Multiple matches found. Be more specific.`;
+                        // Try robust fuzzy matching (strip all whitespace/newlines)
+                        const stripWhitespace = (str) => str.replace(/\s+/g, '');
+                        const strippedContent = stripWhitespace(normalizedContent);
+                        const strippedSearch = stripWhitespace(normalizedSearch);
+                        const strippedIndex = strippedContent.indexOf(strippedSearch);
+                        if (strippedIndex !== -1) {
+                            // Map stripped index back to original content index
+                            let stripCount = 0;
+                            let contentIdx = 0;
+                            while (stripCount < strippedIndex && contentIdx < normalizedContent.length) {
+                                if (!/\s/.test(normalizedContent[contentIdx]))
+                                    stripCount++;
+                                contentIdx++;
+                            }
+                            targetStart = contentIdx;
+                            let searchCharCount = 0;
+                            let endIdx = targetStart;
+                            while (searchCharCount < strippedSearch.length && endIdx < normalizedContent.length) {
+                                if (!/\s/.test(normalizedContent[endIdx]))
+                                    searchCharCount++;
+                                endIdx++;
+                            }
+                            targetEnd = endIdx;
                         }
                         else {
                             // Try to find similar lines to help the model
@@ -393,7 +409,7 @@ function getFileTools() {
                                     }
                                 }
                             }
-                            let hint = `❌ Error: Could not find search text.\n\nTIP: Use read_file first to see exact content.`;
+                            let hint = `❌ Error: Could not find search text.\n\nTIP: Use read_file first to see exact content or use replace_lines.`;
                             if (similarLines.length > 0) {
                                 hint += `\n\nSimilar lines found:\n${similarLines.slice(0, 3).join('\n')}`;
                             }

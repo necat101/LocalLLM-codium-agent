@@ -408,10 +408,9 @@ class ToolRegistry {
                     }
                 }
                 try {
-                    // Use ComSpec if available, fallback to full System32 path for robustness
-                    const winShell = process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe';
+                    // Use PowerShell on Windows for better compatibility with standard commands (ls, cat, curl)
                     const shellOptions = process.platform === 'win32'
-                        ? { shell: winShell }
+                        ? { shell: 'powershell.exe' }
                         : { shell: '/bin/bash' };
                     const { stdout, stderr } = await execAsync(command, {
                         cwd,
